@@ -10,8 +10,12 @@ APP_PORT = int(os.getenv("PORT", "8000"))  # Render provides $PORT
 
 # Brand / parent
 DAVEPMEI_VERSION = os.getenv("DAVEPMEI_VERSION", "1.0.0")
-DAVEPMEI_HOST    = os.getenv("DAVEPMEI_HOST", "davepmei.ai")  # canonical host
+# legacy single-host (kept for backward compat; not used if DAVEPMEI_HOSTS is set)
+DAVEPMEI_HOST    = os.getenv("DAVEPMEI_HOST", "davepmei.ai")
 PARENT_SERVICE   = "PhilMirrorEnginei.ai (PMEi)"
+
+# Multi-host support (comma-separated list). If set, this supersedes DAVEPMEI_HOST.
+DAVEPMEI_HOSTS = [h.strip().lower() for h in os.getenv("DAVEPMEI_HOSTS", "").split(",") if h.strip()]
 
 # CORS (comma-separated list of allowed origins)
 DAVEPMEI_ALLOWED_ORIGINS = [
@@ -19,9 +23,9 @@ DAVEPMEI_ALLOWED_ORIGINS = [
 ]
 
 # Auth + storage
-MEMORY_API_KEY  = os.getenv("MEMORY_API_KEY")                # set in Render
-MEMORY_FILE     = os.getenv("MEMORY_FILE", "pmei_memories.jsonl")
-OPENAPI_FILENAME= os.getenv("OPENAPI_FILENAME", "openapi.json")
+MEMORY_API_KEY   = os.getenv("MEMORY_API_KEY")                # set in Render
+MEMORY_FILE      = os.getenv("MEMORY_FILE", "pmei_memories.jsonl")
+OPENAPI_FILENAME = os.getenv("OPENAPI_FILENAME", "openapi.json")
 
 # ── App ────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -52,10 +56,22 @@ def _load_last_n(n: int):
     except FileNotFoundError:
         return []
 
-# ── Canonical host redirect ────────────────────────────────────────────────────
+# ── Host handling ──────────────────────────────────────────────────────────────
 @app.before_request
-def enforce_canonical_host():
-    host = request.headers.get("Host", "")
+def allow_multiple_hosts():
+    """
+    Accept requests on any host listed in DAVEPMEI_HOSTS.
+    If DAVEPMEI_HOSTS is empty, fall back to legacy DAVEPMEI_HOST single-canonical redirect.
+    If a different host is used, 301 to the first allowed host (or DAVEPMEI_HOST).
+    """
+    host = (request.headers.get("Host") or "").lower()
+
+    if DAVEPMEI_HOSTS:
+        if host and host not in DAVEPMEI_HOSTS:
+            target = DAVEPMEI_HOSTS[0]
+            return redirect(request.url.replace(f"//{host}", f"//{target}", 1), code=301)
+        return  # allowed host → proceed
+    # fallback: legacy single-host enforcement
     if host and DAVEPMEI_HOST and host != DAVEPMEI_HOST:
         return redirect(request.url.replace(f"//{host}", f"//{DAVEPMEI_HOST}", 1), code=301)
 
