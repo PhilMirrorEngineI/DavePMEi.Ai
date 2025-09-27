@@ -12,7 +12,7 @@
   ],
   "components": {
     "securitySchemes": {
-      "MemoryKey": {
+      "ApiKey": {
         "type": "apiKey",
         "in": "header",
         "name": "X-API-KEY"
@@ -67,16 +67,6 @@
           { "type": "object", "additionalProperties": false }
         ],
         "description": "Either a MemoryItem or an empty object when none exists."
-      },
-      "AuthCheckResponse": {
-        "type": "object",
-        "properties": {
-          "seen_header": { "type": "boolean" },
-          "header_len":  { "type": "integer" },
-          "env_is_set":  { "type": "boolean" },
-          "env_len":     { "type": "integer" },
-          "equal":       { "type": "boolean" }
-        }
       }
     }
   },
@@ -84,7 +74,7 @@
     "/save_memory": {
       "post": {
         "operationId": "save_memory",
-        "security": [ { "MemoryKey": [] } ],
+        "security": [ { "ApiKey": [] } ],
         "summary": "Save a compressed memory shard.",
         "requestBody": {
           "required": true,
@@ -103,15 +93,15 @@
               }
             }
           },
-          "401": { "description": "Unauthorized (missing or bad X-API-KEY)" },
-          "400": { "description": "Invalid payload" }
+          "400": { "description": "Invalid payload" },
+          "401": { "description": "Unauthorized (missing or bad X-API-KEY)" }
         }
       }
     },
     "/latest_memory": {
       "get": {
         "operationId": "get_latest_memory",
-        "security": [ { "MemoryKey": [] } ],
+        "security": [ { "ApiKey": [] } ],
         "summary": "Return the most recent memory or empty object.",
         "responses": {
           "200": {
@@ -129,7 +119,7 @@
     "/get_memory": {
       "get": {
         "operationId": "get_memory",
-        "security": [ { "MemoryKey": [] } ],
+        "security": [ { "ApiKey": [] } ],
         "summary": "Return a list of memories (newest first).",
         "parameters": [
           {
@@ -148,22 +138,6 @@
             }
           },
           "401": { "description": "Unauthorized (missing or bad X-API-KEY)" }
-        }
-      }
-    },
-    "/__authcheck": {
-      "get": {
-        "operationId": "authcheck",
-        "summary": "Debug endpoint: shows header/env presence and equality (no secrets).",
-        "responses": {
-          "200": {
-            "description": "Auth debug info",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/AuthCheckResponse" }
-              }
-            }
-          }
         }
       }
     }
