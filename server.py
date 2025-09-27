@@ -11,27 +11,26 @@ APP_PORT = int(os.getenv("PORT", "8000"))  # Render provides $PORT
 
 # Brand / parent
 DAVEPMEI_VERSION = os.getenv("DAVEPMEI_VERSION", "1.0.0")
-# legacy single-host (fallback only)
-DAVEPMEI_HOST = (os.getenv("DAVEPMEI_HOST", "davepmei.ai") or "").strip()
+DAVEPMEI_HOST = (os.getenv("DAVEPMEI_HOST", "") or "").strip()  # legacy fallback
 PARENT_SERVICE = "PhilMirrorEnginei.ai (PMEi)"
 
-# Multi-host support (comma-separated list). If set, supersedes DAVEPMEI_HOST.
+# Multi-host support
 DAVEPMEI_HOSTS = [h.strip().lower() for h in os.getenv("DAVEPMEI_HOSTS", "").split(",") if h.strip()]
 
-# CORS (comma-separated list of allowed origins)
+# CORS (allowed origins)
 DAVEPMEI_ALLOWED_ORIGINS = [
     o.strip() for o in os.getenv("DAVEPMEI_ALLOWED_ORIGINS", "").split(",") if o.strip()
 ]
 
 # Auth + storage
-MEMORY_API_KEY   = os.getenv("MEMORY_API_KEY")                 # set in Render
+MEMORY_API_KEY   = os.getenv("MEMORY_API_KEY")
 MEMORY_FILE      = os.getenv("MEMORY_FILE", "pmei_memories.jsonl")
 OPENAPI_FILENAME = os.getenv("OPENAPI_FILENAME", "openapi.json")
 
 # ── App ────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app)  # respect X-Forwarded-* from Render
-app.url_map.strict_slashes = False     # accept with/without trailing slash everywhere
+app.url_map.strict_slashes = False     # accept with/without trailing slash
 _write_lock = threading.Lock()
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -59,7 +58,7 @@ def _load_last_n(n: int):
         return []
 
 def _redirect_to_host(url: str, target_host: str):
-    """Build a clean 301 Location without newlines; avoid loops."""
+    """Redirect to canonical host if needed."""
     parts = urlsplit(url)
     if not target_host or parts.netloc == target_host:
         return None
@@ -69,20 +68,13 @@ def _redirect_to_host(url: str, target_host: str):
 # ── Host handling ──────────────────────────────────────────────────────────────
 @app.before_request
 def allow_multiple_hosts():
-    """
-    Accept requests on any host listed in DAVEPMEI_HOSTS.
-    If not set, fall back to legacy DAVEPMEI_HOST single-canonical redirect.
-    """
     host = (request.headers.get("Host") or "").lower().strip()
-
     if DAVEPMEI_HOSTS:
         if host and host not in DAVEPMEI_HOSTS:
             resp = _redirect_to_host(request.url, DAVEPMEI_HOSTS[0])
             if resp is not None:
                 return resp
         return
-
-    # fallback single-host enforcement
     if host and DAVEPMEI_HOST and host != DAVEPMEI_HOST:
         resp = _redirect_to_host(request.url, DAVEPMEI_HOST)
         if resp is not None:
@@ -97,11 +89,9 @@ def set_headers(resp):
         resp.headers["Vary"] = "Origin"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-KEY"
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    # Branding / provenance
     resp.headers["X-DavePMEi-Origin"] = "render"
     resp.headers["X-DavePMEi-Version"] = DAVEPMEI_VERSION
     resp.headers["X-Parent-Service"] = PARENT_SERVICE
-    # Hardening
     resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Referrer-Policy"] = "no-referrer"
@@ -120,7 +110,7 @@ def root():
         "routes": ["/health","/openapi.json","/save_memory","/latest_memory","/get_memory"]
     })
 
-# Robust health endpoints (GET/HEAD + aliases + trailing-slash friendly)
+# Health endpoints
 def _health_payload():
     return {
         "ok": True,
@@ -144,7 +134,6 @@ def openapi_spec():
     directory = os.path.abspath(os.path.dirname(__file__))
     return send_from_directory(directory, OPENAPI_FILENAME, mimetype="application/json")
 
-# Preflight for browsers (CORS)
 @app.route("/save_memory", methods=["OPTIONS"])
 def save_memory_options():
     resp = jsonify(ok=True)
@@ -184,11 +173,10 @@ def get_memory():
     items = _load_last_n(limit)
     return jsonify(list(reversed(items)) if items else [])
 
-# Optional alias to match earlier docs: POST /memory → /save_memory
 @app.post("/memory")
 def memory_alias():
     return save_memory()
 
-# ── Local run (Render uses Procfile) ───────────────────────────────────────────
+# ── Local run ──────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=APP_PORT)
