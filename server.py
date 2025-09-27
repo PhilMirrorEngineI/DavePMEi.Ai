@@ -31,6 +31,7 @@ OPENAPI_FILENAME = os.getenv("OPENAPI_FILENAME", "openapi.json")
 # ── App ────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app)  # respect X-Forwarded-* from Render
+app.url_map.strict_slashes = False     # accept with/without trailing slash everywhere
 _write_lock = threading.Lock()
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -119,14 +120,24 @@ def root():
         "routes": ["/health","/openapi.json","/save_memory","/latest_memory","/get_memory"]
     })
 
-@app.get("/health")
-def health():
-    return jsonify({
+# Robust health endpoints (GET/HEAD + aliases + trailing-slash friendly)
+def _health_payload():
+    return {
         "ok": True,
         "service": "DavePMEi.Ai",
         "parent": PARENT_SERVICE,
-        "version": DAVEPMEI_VERSION
-    })
+        "version": DAVEPMEI_VERSION,
+        "time": datetime.utcnow().isoformat() + "Z"
+    }
+
+@app.route("/health", methods=["GET", "HEAD"])
+@app.route("/health/", methods=["GET", "HEAD"])
+@app.route("/status", methods=["GET", "HEAD"])
+@app.route("/healthz", methods=["GET", "HEAD"])
+def health():
+    if request.method == "HEAD":
+        return ("", 200)
+    return jsonify(_health_payload()), 200
 
 @app.get("/openapi.json")
 def openapi_spec():
