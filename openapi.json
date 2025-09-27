@@ -3,7 +3,7 @@
   "info": {
     "title": "DavePMEi.Ai Memory API",
     "version": "1.0.0",
-    "description": "Secure, lawful memory endpoints used by DavePMEi.Ai (parent: PhilMirrorEnginei.ai / PMEi)."
+    "description": "Secure, lawful memory endpoints for DavePMEi.Ai (parent: PhilMirrorEnginei.ai / PMEi)."
   },
   "servers": [
     { "url": "https://davepmei-ai.onrender.com" },
@@ -67,6 +67,16 @@
           { "type": "object", "additionalProperties": false }
         ],
         "description": "Either a MemoryItem or an empty object when none exists."
+      },
+      "AuthCheckResponse": {
+        "type": "object",
+        "properties": {
+          "seen_header": { "type": "boolean" },
+          "header_len":  { "type": "integer" },
+          "env_is_set":  { "type": "boolean" },
+          "env_len":     { "type": "integer" },
+          "equal":       { "type": "boolean" }
+        }
       }
     }
   },
@@ -92,7 +102,9 @@
                 "schema": { "$ref": "#/components/schemas/SaveMemoryResponse" }
               }
             }
-          }
+          },
+          "401": { "description": "Unauthorized (missing or bad X-API-KEY)" },
+          "400": { "description": "Invalid payload" }
         }
       }
     },
@@ -109,7 +121,8 @@
                 "schema": { "$ref": "#/components/schemas/LatestMemoryResponse" }
               }
             }
-          }
+          },
+          "401": { "description": "Unauthorized (missing or bad X-API-KEY)" }
         }
       }
     },
@@ -133,334 +146,21 @@
                 "schema": { "$ref": "#/components/schemas/MemoryList" }
               }
             }
-          }
+          },
+          "401": { "description": "Unauthorized (missing or bad X-API-KEY)" }
         }
       }
-    }
-  }
-}{
-  "openapi": "3.1.0",
-  "info": {
-    "title": "DavePMEi.Ai Memory API",
-    "version": "1.0.0",
-    "description": "Secure, lawful memory endpoints used by DavePMEi.Ai (parent: PhilMirrorEnginei.ai / PMEi)."
-  },
-  "servers": [
-    { "url": "https://davepmei-ai.onrender.com" },
-    { "url": "https://davepmei.ai" },
-    { "url": "https://www.davepmei.ai" }
-  ],
-  "components": {
-    "securitySchemes": {
-      "MemoryKey": {
-        "type": "apiKey",
-        "in": "header",
-        "name": "X-API-KEY"
-      }
     },
-    "schemas": {
-      "SaveMemoryRequest": {
-        "type": "object",
-        "properties": {
-          "user_id":     { "type": "string", "description": "Anchor: user" },
-          "thread_id":   { "type": "string", "description": "Anchor: thread" },
-          "slide_id":    { "type": "string", "description": "Anchor: slide" },
-          "glyph_echo":  { "type": "string" },
-          "drift_score": { "type": "number" },
-          "seal":        { "type": "string" },
-          "content":     { "type": "string" }
-        },
-        "required": ["user_id","thread_id","slide_id","glyph_echo","drift_score","seal","content"],
-        "additionalProperties": false
-      },
-      "MemoryItem": {
-        "type": "object",
-        "properties": {
-          "user_id":     { "type": "string" },
-          "thread_id":   { "type": "string" },
-          "slide_id":    { "type": "string" },
-          "glyph_echo":  { "type": "string" },
-          "drift_score": { "type": "number" },
-          "seal":        { "type": "string" },
-          "content":     { "type": "string" },
-          "ts":          { "type": "integer", "description": "Unix seconds" }
-        },
-        "required": ["user_id","thread_id","slide_id","glyph_echo","drift_score","seal","content","ts"],
-        "additionalProperties": false
-      },
-      "MemoryList": {
-        "type": "array",
-        "items": { "$ref": "#/components/schemas/MemoryItem" }
-      },
-      "SaveMemoryResponse": {
-        "type": "object",
-        "properties": {
-          "status":   { "type": "string", "example": "saved" },
-          "slide_id": { "type": "string" }
-        },
-        "required": ["status", "slide_id"],
-        "additionalProperties": false
-      },
-      "LatestMemoryResponse": {
-        "oneOf": [
-          { "$ref": "#/components/schemas/MemoryItem" },
-          { "type": "object", "additionalProperties": false }
-        ],
-        "description": "Either a MemoryItem or an empty object when none exists."
-      }
-    }
-  },
-  "paths": {
-    "/health": {
+    "/__authcheck": {
       "get": {
-        "operationId": "health",
-        "summary": "Service health/status.",
+        "operationId": "authcheck",
+        "summary": "Debug endpoint: shows header/env presence and equality (no secrets).",
         "responses": {
           "200": {
-            "description": "Service OK",
+            "description": "Auth debug info",
             "content": {
               "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "ok":      { "type": "boolean", "example": true },
-                    "service": { "type": "string", "example": "DavePMEi.Ai" },
-                    "parent":  { "type": "string", "example": "PhilMirrorEnginei.ai (PMEi)" },
-                    "version": { "type": "string", "example": "1.0.0" },
-                    "time":    { "type": "string", "example": "2025-09-27T15:00:00Z" }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/save_memory": {
-      "post": {
-        "operationId": "save_memory",
-        "security": [ { "MemoryKey": [] } ],
-        "summary": "Save a compressed memory shard.",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": { "$ref": "#/components/schemas/SaveMemoryRequest" }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Memory saved",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/SaveMemoryResponse" }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/latest_memory": {
-      "get": {
-        "operationId": "get_latest_memory",
-        "security": [ { "MemoryKey": [] } ],
-        "summary": "Return the most recent memory or empty object.",
-        "responses": {
-          "200": {
-            "description": "Latest memory (or empty object)",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/LatestMemoryResponse" }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/get_memory": {
-      "get": {
-        "operationId": "get_memory",
-        "security": [ { "MemoryKey": [] } ],
-        "summary": "Return a list of memories (newest first).",
-        "parameters": [
-          {
-            "name": "limit",
-            "in": "query",
-            "schema": { "type": "integer", "default": 10, "minimum": 1, "maximum": 200 }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Array of memory items",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/MemoryList" }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}{
-  "openapi": "3.1.0",
-  "info": {
-    "title": "DavePMEi.Ai Memory API",
-    "version": "1.0.0",
-    "description": "Secure, lawful memory endpoints used by DavePMEi.Ai (parent: PhilMirrorEnginei.ai / PMEi)."
-  },
-  "servers": [
-    { "url": "https://davepmei-ai.onrender.com" },
-    { "url": "https://davepmei.ai" },
-    { "url": "https://www.davepmei.ai" }
-  ],
-  "components": {
-    "securitySchemes": {
-      "MemoryKey": {
-        "type": "apiKey",
-        "in": "header",
-        "name": "X-API-KEY"
-      }
-    },
-    "schemas": {
-      "SaveMemoryRequest": {
-        "type": "object",
-        "properties": {
-          "user_id":     { "type": "string", "description": "Anchor: user" },
-          "thread_id":   { "type": "string", "description": "Anchor: thread" },
-          "slide_id":    { "type": "string", "description": "Anchor: slide" },
-          "glyph_echo":  { "type": "string" },
-          "drift_score": { "type": "number" },
-          "seal":        { "type": "string" },
-          "content":     { "type": "string" }
-        },
-        "required": ["user_id","thread_id","slide_id","glyph_echo","drift_score","seal","content"],
-        "additionalProperties": false
-      },
-      "MemoryItem": {
-        "type": "object",
-        "properties": {
-          "user_id":     { "type": "string" },
-          "thread_id":   { "type": "string" },
-          "slide_id":    { "type": "string" },
-          "glyph_echo":  { "type": "string" },
-          "drift_score": { "type": "number" },
-          "seal":        { "type": "string" },
-          "content":     { "type": "string" },
-          "ts":          { "type": "integer", "description": "Unix seconds" }
-        },
-        "required": ["user_id","thread_id","slide_id","glyph_echo","drift_score","seal","content","ts"],
-        "additionalProperties": false
-      },
-      "MemoryList": {
-        "type": "array",
-        "items": { "$ref": "#/components/schemas/MemoryItem" }
-      },
-      "SaveMemoryResponse": {
-        "type": "object",
-        "properties": {
-          "status":   { "type": "string", "example": "saved" },
-          "slide_id": { "type": "string" }
-        },
-        "required": ["status", "slide_id"],
-        "additionalProperties": false
-      },
-      "LatestMemoryResponse": {
-        "oneOf": [
-          { "$ref": "#/components/schemas/MemoryItem" },
-          { "type": "object", "additionalProperties": false }
-        ],
-        "description": "Either a MemoryItem or an empty object when none exists."
-      }
-    }
-  },
-  "paths": {
-    "/health": {
-      "get": {
-        "operationId": "health",
-        "summary": "Service health/status.",
-        "responses": {
-          "200": {
-            "description": "Service OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "ok":      { "type": "boolean", "example": true },
-                    "service": { "type": "string", "example": "DavePMEi.Ai" },
-                    "parent":  { "type": "string", "example": "PhilMirrorEnginei.ai (PMEi)" },
-                    "version": { "type": "string", "example": "1.0.0" },
-                    "time":    { "type": "string", "example": "2025-09-27T15:00:00Z" }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/save_memory": {
-      "post": {
-        "operationId": "save_memory",
-        "security": [ { "MemoryKey": [] } ],
-        "summary": "Save a compressed memory shard.",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": { "$ref": "#/components/schemas/SaveMemoryRequest" }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Memory saved",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/SaveMemoryResponse" }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/latest_memory": {
-      "get": {
-        "operationId": "get_latest_memory",
-        "security": [ { "MemoryKey": [] } ],
-        "summary": "Return the most recent memory or empty object.",
-        "responses": {
-          "200": {
-            "description": "Latest memory (or empty object)",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/LatestMemoryResponse" }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/get_memory": {
-      "get": {
-        "operationId": "get_memory",
-        "security": [ { "MemoryKey": [] } ],
-        "summary": "Return a list of memories (newest first).",
-        "parameters": [
-          {
-            "name": "limit",
-            "in": "query",
-            "schema": { "type": "integer", "default": 10, "minimum": 1, "maximum": 200 }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Array of memory items",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/MemoryList" }
+                "schema": { "$ref": "#/components/schemas/AuthCheckResponse" }
               }
             }
           }
