@@ -1,11 +1,15 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "PMEA Memory API",
+    "title": "DavePMEi.Ai Memory API",
     "version": "1.0.0",
-    "description": "Endpoints Dave uses to save and retrieve lawful memory shards."
+    "description": "Secure, lawful memory endpoints used by DavePMEi.Ai (parent: PhilMirrorEnginei.ai / PMEi)."
   },
-"servers": [ { "url": "https://philmirrorenginei.ai" } ]
+  "servers": [
+    { "url": "https://davepmei-ai.onrender.com" },
+    { "url": "https://davepmei.ai" },
+    { "url": "https://www.davepmei.ai" }
+  ],
   "components": {
     "securitySchemes": {
       "MemoryKey": {
@@ -18,28 +22,28 @@
       "SaveMemoryRequest": {
         "type": "object",
         "properties": {
-          "user_id":   { "type": "string", "description": "Anchor: user" },
-          "thread_id": { "type": "string", "description": "Anchor: thread" },
-          "slide_id":  { "type": "string", "description": "Anchor: slide" },
-          "glyph_echo": { "type": "string" },
+          "user_id":     { "type": "string", "description": "Anchor: user" },
+          "thread_id":   { "type": "string", "description": "Anchor: thread" },
+          "slide_id":    { "type": "string", "description": "Anchor: slide" },
+          "glyph_echo":  { "type": "string" },
           "drift_score": { "type": "number" },
-          "seal": { "type": "string" },
-          "content": { "type": "string" }
+          "seal":        { "type": "string" },
+          "content":     { "type": "string" }
         },
-        "required": ["user_id", "thread_id", "slide_id", "glyph_echo", "drift_score", "seal", "content"],
+        "required": ["user_id","thread_id","slide_id","glyph_echo","drift_score","seal","content"],
         "additionalProperties": false
       },
       "MemoryItem": {
         "type": "object",
         "properties": {
-          "user_id":   { "type": "string" },
-          "thread_id": { "type": "string" },
-          "slide_id":  { "type": "string" },
-          "glyph_echo": { "type": "string" },
+          "user_id":     { "type": "string" },
+          "thread_id":   { "type": "string" },
+          "slide_id":    { "type": "string" },
+          "glyph_echo":  { "type": "string" },
           "drift_score": { "type": "number" },
-          "seal": { "type": "string" },
-          "content": { "type": "string" },
-          "ts": { "type": "integer", "description": "unix seconds" }
+          "seal":        { "type": "string" },
+          "content":     { "type": "string" },
+          "ts":          { "type": "integer", "description": "Unix seconds" }
         },
         "required": ["user_id","thread_id","slide_id","glyph_echo","drift_score","seal","content","ts"],
         "additionalProperties": false
@@ -51,7 +55,7 @@
       "SaveMemoryResponse": {
         "type": "object",
         "properties": {
-          "status": { "type": "string" },
+          "status":   { "type": "string", "example": "saved" },
           "slide_id": { "type": "string" }
         },
         "required": ["status", "slide_id"],
@@ -67,6 +71,31 @@
     }
   },
   "paths": {
+    "/health": {
+      "get": {
+        "operationId": "health",
+        "summary": "Service health/status.",
+        "responses": {
+          "200": {
+            "description": "Service OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok":      { "type": "boolean", "example": true },
+                    "service": { "type": "string", "example": "DavePMEi.Ai" },
+                    "parent":  { "type": "string", "example": "PhilMirrorEnginei.ai (PMEi)" },
+                    "version": { "type": "string", "example": "1.0.0" },
+                    "time":    { "type": "string", "example": "2025-09-27T15:00:00Z" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/save_memory": {
       "post": {
         "operationId": "save_memory",
