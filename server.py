@@ -1,4 +1,4 @@
-# server.py  — DavePMEi.Ai (PMEi) render service
+# server.py — DavePMEi.Ai (PMEi) render service
 import os, json, time, threading
 from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit
@@ -9,11 +9,14 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 # ── Config ─────────────────────────────────────────────────────────────────────
 APP_PORT = int(os.getenv("PORT", "8000"))
 DAVEPMEI_VERSION = os.getenv("DAVEPMEI_VERSION", "1.0.0")
-DAVEPMEI_HOST = (os.getenv("DAVEPMEI_HOST", "") or "").strip()  # legacy fallback
+DAVEPMEI_HOST = (os.getenv("DAVEPMEI_HOST", "") or "").strip()
 PARENT_SERVICE = "PhilMirrorEnginei.ai (PMEi)"
 DAVEPMEI_HOSTS = [h.strip().lower() for h in os.getenv("DAVEPMEI_HOSTS", "").split(",") if h.strip()]
-DAVEPMEI_ALLOWED_ORIGINS = [o.strip() for o in os.getenv("DAVEPMEI_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+DAVEPMEI_ALLOWED_ORIGINS = [
+    o.strip() for o in os.getenv("DAVEPMEI_ALLOWED_ORIGINS", "").split(",") if o.strip()
+]
 
+# 🔑 Correct naming: MEMORY_API_KEY from env matches X-API-KEY header
 MEMORY_API_KEY   = os.getenv("MEMORY_API_KEY")
 MEMORY_FILE      = os.getenv("MEMORY_FILE", "pmei_memories.jsonl")
 OPENAPI_FILENAME = os.getenv("OPENAPI_FILENAME", "openapi.json")
@@ -23,9 +26,6 @@ app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app)
 app.url_map.strict_slashes = False
 _write_lock = threading.Lock()
-
-# quick visibility that the env key is present (not the value)
-app.logger.info("MEMORY_API_KEY present=%s len=%d", bool(MEMORY_API_KEY), len(MEMORY_API_KEY or ""))
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def require_api_key():
@@ -73,7 +73,7 @@ def allow_multiple_hosts():
         if resp is not None:
             return resp
 
-# ── Security / CORS ───────────────────────────────────────────────────────────
+# ── Security Headers ──────────────────────────────────────────────────────────
 @app.after_request
 def set_headers(resp):
     origin = request.headers.get("Origin")
@@ -108,16 +108,9 @@ def openapi_spec():
     directory = os.path.abspath(os.path.dirname(__file__))
     return send_from_directory(directory, OPENAPI_FILENAME, mimetype="application/json")
 
-# CORS preflight
 @app.route("/save_memory", methods=["OPTIONS"])
 def save_memory_options():
     resp = jsonify(ok=True)
-    origin = request.headers.get("Origin")
-    if origin and origin in DAVEPMEI_ALLOWED_ORIGINS:
-        resp.headers["Access-Control-Allow-Origin"] = origin
-        resp.headers["Vary"] = "Origin"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-KEY"
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return resp, 204
 
 @app.post("/save_memory")
@@ -148,23 +141,9 @@ def get_memory():
     items = _load_last_n(limit)
     return jsonify(list(reversed(items)) if items else [])
 
-# Alias
 @app.post("/memory")
 def memory_alias():
     return save_memory()
-
-# Auth debug (does NOT reveal the key)
-@app.get("/__authcheck")
-def __authcheck():
-    hdr = request.headers.get("X-API-KEY", "")
-    env = MEMORY_API_KEY or ""
-    return jsonify(
-        seen_header=bool(hdr),
-        header_len=len(hdr),
-        env_is_set=bool(env),
-        env_len=len(env),
-        equal=(hdr == env)
-    ), 200
 
 # ── Local run ──────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
