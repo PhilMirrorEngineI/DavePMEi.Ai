@@ -11,13 +11,16 @@ from flask import Flask, request, jsonify, g, Response
 # -----------------------------
 MEMORY_API_KEY = os.environ.get("MEMORY_API_KEY", "").strip()
 
-# Use a persistent path if available (Render Disk mounted at /var/data), else local file
-DEFAULT_DB_PATH = "/var/data/dave.sqlite3" if os.path.isdir("/var/data") else "./dave.sqlite3"
+# Prefer Render Disk at /data; fall back to local file
+DEFAULT_DB_PATH = "/data/dave.sqlite3" if os.path.isdir("/data") else "./dave.sqlite3"
 DB_PATH = os.environ.get("DB_PATH", DEFAULT_DB_PATH)
 
 OPENAPI_PATH = os.environ.get("OPENAPI_PATH", "./openapi.json")
 
 app = Flask(__name__)
+
+# Ensure DB directory exists (no-op if already there)
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 # -----------------------------
 # DB helpers
@@ -34,20 +37,20 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS memories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            thread_id TEXT NOT NULL,
-            slide_id TEXT NOT NULL,
+            user_id    TEXT NOT NULL,
+            thread_id  TEXT NOT NULL,
+            slide_id   TEXT NOT NULL,
             glyph_echo TEXT NOT NULL,
             drift_score REAL NOT NULL,
-            seal TEXT NOT NULL,
-            content TEXT NOT NULL,
-            ts INTEGER NOT NULL
+            seal       TEXT NOT NULL,
+            content    TEXT NOT NULL,
+            ts         INTEGER NOT NULL
         );
         """
     )
-    db.execute("CREATE INDEX IF NOT EXISTS idx_mem_ts ON memories(ts DESC);")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_mem_ts     ON memories(ts DESC);")
     db.execute("CREATE INDEX IF NOT EXISTS idx_mem_thread ON memories(thread_id);")
-    db.execute("CREATE INDEX IF NOT EXISTS idx_mem_user ON memories(user_id);")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_mem_user   ON memories(user_id);")
     db.commit()
 
 @app.teardown_appcontext
@@ -68,11 +71,11 @@ def unauthorized():
 
 @app.before_request
 def auth_gate():
-    # open endpoints: health + schema
+    # Open endpoints: health + schema
     if request.path in ("/health", "/healthz", "/openapi.json"):
         return
-    # everything else requires X-API-KEY
-    api_key = request.headers.get("X-API-KEY")  # NOTE: dash, not underscore
+    # Everything else requires X-API-KEY (dash, not underscore)
+    api_key = request.headers.get("X-API-KEY")
     if not api_key or api_key != MEMORY_API_KEY:
         return unauthorized()
 
@@ -97,12 +100,12 @@ def validate_payload(required_fields, data):
         return False, f"Missing required fields: {', '.join(missing)}"
     return True, ""
 
-# simple, minimal PII masking
+# Minimal PII masking
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 PHONE_RE = re.compile(r"\+?\d[\d\s().-]{7,}\d")
 
 def privacy_mask(text: str) -> str:
-    text = EMAIL_RE.sub("[redacted-email]", text)
+    text = EMAIL_RE.sub("[redacted-email]", text or "")
     text = PHONE_RE.sub("[redacted-phone]", text)
     return text
 
@@ -116,7 +119,6 @@ def health():
 
 @app.route("/openapi.json")
 def openapi_file():
-    # Serve the local openapi.json file (keeps Actions/editor in sync)
     try:
         with open(OPENAPI_PATH, "r", encoding="utf-8") as f:
             payload = f.read()
@@ -173,15 +175,13 @@ def latest_memory():
 
 @app.route("/get_memory", methods=["GET"])
 def get_memory():
-    # filters from query (as per schema)
     limit = max(1, min(int(request.args.get("limit", 10)), 200))
     user_id = request.args.get("user_id")
     thread_id = request.args.get("thread_id")
     slide_id = request.args.get("slide_id")
     seal = request.args.get("seal")
 
-    clauses = []
-    params = []
+    clauses, params = [], []
     if user_id:
         clauses.append("user_id = ?")
         params.append(user_id)
@@ -204,8 +204,7 @@ def get_memory():
 
     db = get_db()
     rows = db.execute(sql, params).fetchall()
-    items = [row_to_memory_item(r) for r in rows]
-    return jsonify(items)
+    return jsonify([row_to_memory_item(r) for r in rows])
 
 @app.route("/privacy_filter", methods=["POST"])
 def privacy_filter():
@@ -216,15 +215,13 @@ def privacy_filter():
     return jsonify({"filtered_content": privacy_mask(str(data["content"]))})
 
 # -----------------------------
-# App startup
+# App startup (Flask 3 compatible)
 # -----------------------------
-@app.before_first_request
+@app.before_serving
 def _ensure_ready():
-    # Ensure DB and tables exist before first request
+    # Ensure DB and tables exist before the app starts serving requests
     init_db()
 
-# Optional: run with `python server.py` locally (Render uses gunicorn via Procfile)
 if __name__ == "__main__":
-    # Simple local runner
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
