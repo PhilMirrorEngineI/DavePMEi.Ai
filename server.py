@@ -1,28 +1,57 @@
 # server.py — PMEi Memory API (Dave)
 # ----------------------------------
-# Minimal, strict, privacy-first memory shard service.
+# Minimal, strict, privacy-first memory shard service with:
+# - Nightly backups (JSONL snapshots)
+# - /metrics endpoint
+# - Simple per-IP rate limiting
 
 import os
 import re
 import json
 import time
+import shutil
 import threading
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 
-from flask import Flask, request, jsonify, Response, make_response, send_file
+from flask import Flask, request, jsonify, Response, send_file
 
 # -----------------------
 # Config & global state
 # -----------------------
 app = Flask(__name__)
 
+# Storage/config
 MEMORY_FILE = os.environ.get("MEMORY_FILE", "pmei_memories.jsonl")
 OPENAPI_FILENAME = os.environ.get("OPENAPI_FILENAME", "openapi.json")
 EXPECTED_API_KEY = os.environ.get("MEMORY_API_KEY", "").strip()
 ALLOWED_HOSTS = set(h.strip().lower() for h in os.environ.get("DAVEPMEI_ALLOWED_HOSTS", "").split(",") if h.strip())
 
+# Backups
+BACKUP_DIR = os.environ.get("BACKUP_DIR", "backups")
+# Hour (UTC) to run nightly backup; default 03:00 UTC
+BACKUP_HOUR_UTC = int(os.environ.get("BACKUP_HOUR_UTC", "3"))
+
+# Rate limiting (per-IP)
+RATE_LIMIT_WINDOW_SEC = int(os.environ.get("RATE_LIMIT_WINDOW_SEC", "60"))
+RATE_LIMIT_MAX = int(os.environ.get("RATE_LIMIT_MAX", "120"))
+
 LOCK = threading.Lock()
 LATEST: Optional[Dict[str, Any]] = None  # in-process cache of most recent shard
+
+# Metrics (very simple in-memory counters)
+METRICS = {
+    "started_ts": int(time.time()),
+    "total_requests": 0,
+    "saved_memories": 0,
+    "errors_4xx": 0,
+    "errors_5xx": 0,
+    "rate_limited": 0,
+}
+
+# Rate-limit buckets: ip -> list[timestamps]
+RL_BUCKETS: Dict[str, List[float]] = {}
+RL_LOCK = threading.Lock()
 
 
 # -----------------------
@@ -47,7 +76,7 @@ def no_store(resp: Response) -> Response:
 def get_api_key_from_request() -> str:
     """
     Accept either:
-      - X-API-KEY: <key>     (preferred)
+      - X-API-KEY: <key>      (preferred)
       - MEMORY_API_KEY: <key> (legacy/compat)
     """
     return (
@@ -152,6 +181,96 @@ def mask_pii(text: str) -> str:
 
 
 # -----------------------
+# Rate limiting hooks
+# -----------------------
+@app.before_request
+def _before_request_metrics_and_rl():
+    # metrics: count request
+    METRICS["total_requests"] += 1
+
+    # allow-list some public endpoints from RL
+    path = request.path or ""
+    if path in ("/health", "/healthz", "/openapi.json"):
+        return
+
+    # very simple sliding-window per-IP limiter
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    now = time.time()
+    with RL_LOCK:
+        bucket = RL_BUCKETS.get(ip)
+        if bucket is None:
+            bucket = []
+            RL_BUCKETS[ip] = bucket
+        # drop timestamps outside window
+        cutoff = now - RATE_LIMIT_WINDOW_SEC
+        i = 0
+        while i < len(bucket) and bucket[i] < cutoff:
+            i += 1
+        if i:
+            del bucket[:i]
+        # check capacity
+        if len(bucket) >= RATE_LIMIT_MAX:
+            METRICS["rate_limited"] += 1
+            return jsonify({
+                "error": "rate_limited",
+                "code": "too_many_requests",
+                "request_id": req_id(),
+                "window_sec": RATE_LIMIT_WINDOW_SEC,
+                "limit": RATE_LIMIT_MAX
+            }), 429
+        # record
+        bucket.append(now)
+
+
+@app.after_request
+def _after_request_status_counts(resp: Response):
+    try:
+        code = int(resp.status_code)
+        if 400 <= code < 500:
+            METRICS["errors_4xx"] += 1
+        elif code >= 500:
+            METRICS["errors_5xx"] += 1
+    except Exception:
+        pass
+    return resp
+
+
+# -----------------------
+# Nightly backup daemon
+# -----------------------
+def _seconds_until_next_backup_utc(hour_utc: int) -> float:
+    now = datetime.now(timezone.utc)
+    target = now.replace(hour=hour_utc, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+def _run_backup_daemon():
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    while True:
+        try:
+            # sleep until the next scheduled time (UTC hour)
+            time.sleep(_seconds_until_next_backup_utc(BACKUP_HOUR_UTC))
+
+            # build snapshot filename
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            dst = os.path.join(BACKUP_DIR, f"backup_{stamp}.jsonl")
+
+            # perform copy under lock to avoid partial line
+            with LOCK:
+                if os.path.exists(MEMORY_FILE):
+                    shutil.copyfile(MEMORY_FILE, dst)
+        except Exception:
+            # never crash the daemon; wait 60s and try again
+            time.sleep(60)
+
+
+# fire-and-forget background thread
+threading.Thread(target=_run_backup_daemon, name="backup-daemon", daemon=True).start()
+
+
+# -----------------------
 # Routes
 # -----------------------
 @app.get("/health")
@@ -160,7 +279,9 @@ def health():
         "ok": True,
         "service": "Dave PMEi memory API",
         "ts": ts_now_ms(),
-        "routes": ["/health", "/healthz", "/openapi.json", "/save_memory", "/latest_memory", "/get_memory", "/privacy_filter"],
+        "routes": ["/health", "/healthz", "/openapi.json", "/save_memory", "/latest_memory", "/get_memory", "/privacy_filter", "/metrics"],
+        "rate_limit_window_sec": RATE_LIMIT_WINDOW_SEC,
+        "rate_limit_max": RATE_LIMIT_MAX,
     })
 
 
@@ -173,8 +294,24 @@ def healthz():
 def openapi_json():
     if not os.path.exists(OPENAPI_FILENAME):
         return jsonify({"error": f"{OPENAPI_FILENAME} not found"}), 404
-    # Let clients cache spec for a little while
+    # Spec can be cached by clients
     return send_file(OPENAPI_FILENAME, mimetype="application/json")
+
+
+@app.get("/metrics")
+def metrics():
+    # Simple read-only metrics (public). Add auth if you prefer.
+    uptime = int(time.time()) - METRICS["started_ts"]
+    data = {
+        "uptime_seconds": uptime,
+        "total_requests": METRICS["total_requests"],
+        "saved_memories": METRICS["saved_memories"],
+        "errors_4xx": METRICS["errors_4xx"],
+        "errors_5xx": METRICS["errors_5xx"],
+        "rate_limited": METRICS["rate_limited"],
+        "ts": ts_now_ms()
+    }
+    return jsonify(data)
 
 
 @app.post("/save_memory")
@@ -203,6 +340,7 @@ def save_memory():
         append_jsonl(shard)
         global LATEST
         LATEST = shard
+        METRICS["saved_memories"] += 1
 
     return jsonify({
         "status": "ok",
@@ -275,11 +413,10 @@ def privacy_filter():
 
 
 # -----------------------
-# Entrypoint (optional)
+# Entrypoint (local dev)
 # -----------------------
 if __name__ == "__main__":
-    # Local dev: `python server.py`
     # For Render/Prod use gunicorn:
-    #   gunicorn server:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-class gthread --timeout 60
+    #   web: gunicorn server:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-class gthread --timeout 60
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
