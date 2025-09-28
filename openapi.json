@@ -1,17 +1,16 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "PMEi Memory API (Dave)",
-    "version": "1.0.1",
-    "description": "Secure, lawful memory shards for PhilMirrorEnginei.ai (PMEi)."
+    "title": "PMEi Memory API",
+    "version": "1.0.3",
+    "description": "Lawful memory shards for Dave/PMEi. Minimal, strict, privacy-first."
   },
   "servers": [
-    { "url": "https://www.philmirrorenginei.ai" },
-    { "url": "https://philmirrorenginei.ai" }
+    { "url": "https://www.philmirrorenginei.ai" }
   ],
   "components": {
     "securitySchemes": {
-      "ApiKey": {
+      "MemoryKey": {
         "type": "apiKey",
         "in": "header",
         "name": "X-API-KEY"
@@ -20,6 +19,7 @@
     "schemas": {
       "SaveMemoryRequest": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "user_id": { "type": "string" },
           "thread_id": { "type": "string" },
@@ -29,19 +29,11 @@
           "seal": { "type": "string" },
           "content": { "type": "string" }
         },
-        "required": [
-          "user_id",
-          "thread_id",
-          "slide_id",
-          "glyph_echo",
-          "drift_score",
-          "seal",
-          "content"
-        ],
-        "additionalProperties": false
+        "required": ["user_id","thread_id","slide_id","glyph_echo","drift_score","seal","content"]
       },
       "MemoryItem": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "user_id": { "type": "string" },
           "thread_id": { "type": "string" },
@@ -50,59 +42,68 @@
           "drift_score": { "type": "number" },
           "seal": { "type": "string" },
           "content": { "type": "string" },
-          "ts": { "type": "integer", "description": "Unix timestamp (seconds)" }
+          "ts": { "type": "integer", "format": "int64" },
+          "request_id": { "type": "string" }
         },
-        "required": [
-          "user_id",
-          "thread_id",
-          "slide_id",
-          "glyph_echo",
-          "drift_score",
-          "seal",
-          "content",
-          "ts"
-        ],
-        "additionalProperties": false
+        "required": ["user_id","thread_id","slide_id","glyph_echo","drift_score","seal","content","ts","request_id"]
       },
       "MemoryList": {
         "type": "array",
-        "items": { "$ref": "#/components/schemas/MemoryItem" }
+        "items": { "$ref": "#/components/schemas/MemoryItem" },
+        "maxItems": 200
+      },
+      "MaybeMemory": {
+        "type": "object",
+        "description": "Latest memory or {} when none.",
+        "additionalProperties": false,
+        "properties": {
+          "user_id": { "type": "string" },
+          "thread_id": { "type": "string" },
+          "slide_id": { "type": "string" },
+          "glyph_echo": { "type": "string" },
+          "drift_score": { "type": "number" },
+          "seal": { "type": "string" },
+          "content": { "type": "string" },
+          "ts": { "type": "integer", "format": "int64" },
+          "request_id": { "type": "string" }
+        }
       },
       "SaveMemoryResponse": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
-          "status": { "type": "string", "example": "saved" },
-          "slide_id": { "type": "string" }
+          "status": { "type": "string", "enum": ["ok"] },
+          "slide_id": { "type": "string" },
+          "ts": { "type": "integer", "format": "int64" },
+          "request_id": { "type": "string" }
         },
-        "required": ["status", "slide_id"],
-        "additionalProperties": false
-      },
-      "LatestMemoryResponse": {
-        "oneOf": [
-          { "$ref": "#/components/schemas/MemoryItem" },
-          { "type": "object", "additionalProperties": false }
-        ],
-        "description": "Either a MemoryItem or empty object when none exists."
+        "required": ["status","slide_id","ts","request_id"]
       },
       "PrivacyFilterRequest": {
         "type": "object",
-        "properties": {
-          "content": { "type": "string" }
-        },
-        "required": ["content"],
-        "additionalProperties": false
+        "additionalProperties": false,
+        "properties": { "content": { "type": "string" } },
+        "required": ["content"]
       },
       "PrivacyFilterResponse": {
         "type": "object",
+        "additionalProperties": false,
+        "properties": { "filtered_content": { "type": "string" } },
+        "required": ["filtered_content"]
+      },
+      "Error": {
+        "type": "object",
+        "additionalProperties": false,
         "properties": {
-          "filtered_content": { "type": "string" }
+          "error": { "type": "string" },
+          "code": { "type": "string" },
+          "request_id": { "type": "string" }
         },
-        "required": ["filtered_content"],
-        "additionalProperties": false
+        "required": ["error","code","request_id"]
       }
     }
   },
-  "security": [{ "ApiKey": [] }],
+  "security": [{ "MemoryKey": [] }],
   "paths": {
     "/health": {
       "get": {
@@ -110,15 +111,13 @@
         "operationId": "health_check",
         "security": [],
         "responses": {
-          "200": {
-            "description": "OK"
-          }
+          "200": { "description": "OK" }
         }
       }
     },
     "/healthz": {
       "get": {
-        "summary": "Liveness check",
+        "summary": "Alias health check",
         "operationId": "healthz",
         "security": [],
         "responses": {
@@ -126,29 +125,33 @@
         }
       }
     },
+    "/openapi.json": {
+      "get": {
+        "summary": "Return the API schema",
+        "operationId": "openapi",
+        "security": [],
+        "responses": {
+          "200": { "description": "OpenAPI document" }
+        }
+      }
+    },
     "/save_memory": {
       "post": {
-        "summary": "Save a memory shard",
+        "summary": "Save a compressed memory shard",
         "operationId": "save_memory",
         "requestBody": {
           "required": true,
           "content": {
-            "application/json": {
-              "schema": { "$ref": "#/components/schemas/SaveMemoryRequest" }
-            }
+            "application/json": { "schema": { "$ref": "#/components/schemas/SaveMemoryRequest" } }
           }
         },
         "responses": {
           "200": {
-            "description": "Memory saved",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/SaveMemoryResponse" }
-              }
-            }
+            "description": "Saved",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SaveMemoryResponse" } } }
           },
-          "400": { "description": "Bad request" },
-          "401": { "description": "Unauthorized (missing or invalid API key)" }
+          "400": { "description": "Bad request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "description": "Unauthorized", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
       }
     },
@@ -157,15 +160,8 @@
         "summary": "Return the most recent memory or {}",
         "operationId": "get_latest_memory",
         "responses": {
-          "200": {
-            "description": "Latest memory (or empty object)",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/LatestMemoryResponse" }
-              }
-            }
-          },
-          "401": { "description": "Unauthorized" }
+          "200": { "description": "Latest memory", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MaybeMemory" } } } },
+          "401": { "description": "Unauthorized", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
       }
     },
@@ -174,52 +170,29 @@
         "summary": "Return a list of memories (newest first)",
         "operationId": "get_memory",
         "parameters": [
-          {
-            "name": "limit",
-            "in": "query",
-            "schema": {
-              "type": "integer",
-              "default": 10,
-              "minimum": 1,
-              "maximum": 200
-            }
-          }
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 10, "minimum": 1, "maximum": 200 } },
+          { "name": "user_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "thread_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "slide_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "seal", "in": "query", "schema": { "type": "string" } }
         ],
         "responses": {
-          "200": {
-            "description": "Array of memory items",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/MemoryList" }
-              }
-            }
-          },
-          "401": { "description": "Unauthorized" }
+          "200": { "description": "Array of memory items", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MemoryList" } } } },
+          "401": { "description": "Unauthorized", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
       }
     },
     "/privacy_filter": {
       "post": {
-        "summary": "Filter sensitive/PII data from input before saving",
+        "summary": "Filter sensitive/PII data before saving",
         "operationId": "privacy_filter",
         "requestBody": {
           "required": true,
-          "content": {
-            "application/json": {
-              "schema": { "$ref": "#/components/schemas/PrivacyFilterRequest" }
-            }
-          }
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PrivacyFilterRequest" } } }
         },
         "responses": {
-          "200": {
-            "description": "Filtered text returned",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/PrivacyFilterResponse" }
-              }
-            }
-          },
-          "400": { "description": "Bad request" }
+          "200": { "description": "Filtered text returned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PrivacyFilterResponse" } } } },
+          "400": { "description": "Bad request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
       }
     }
