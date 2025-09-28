@@ -39,12 +39,12 @@ def _now() -> int:
     return int(time.time())
 
 def _incoming_key() -> Optional[str]:
-    # accept both header spellings (covers Actions/editor quirks)
+    # Accept both spellings; last resort ?key= for manual tests.
     return (
         request.headers.get("X-API-KEY")
         or request.headers.get("X_API_KEY")
         or request.headers.get("MEMORY_API_KEY")
-        or request.args.get("key")  # last resort for manual tests
+        or request.args.get("key")
     )
 
 def _json_error(code: int, msg: str):
@@ -75,8 +75,8 @@ OPEN_ROUTES = {"/health", "/healthz", "/openapi.json"}
 
 @app.before_request
 def _gate():
-    # allow health & schema without key
-    if request.path in OPEN_ROUTES:
+    # Allow health & schema without key
+    if request.path in OPEN_ROUTES or request.method == "OPTIONS":
         return None
     if not MEMORY_API_KEY:
         return _json_error(500, "Server missing MEMORY_API_KEY")
@@ -140,24 +140,19 @@ def _validate_save_payload(d: Dict[str, Any]):
 # Routes
 # ---------------------------
 @app.get("/health")
-@app.route("/health", methods=["GET"])
 def health():
     return jsonify(
         status="ok",
         service="DavePMEi.Ai",
-        version=os.getenv("DAVEPMEI_VERSION", "unknown"),
-        host=os.getenv("DAVEPMEI_HOST", "unset"),
-        routes=["/health", "/healthz", "/openapi.json", "/save_memory", "/latest_memory", "/get_memory", "/privacy_filter"],
-        ts=_now()
+        version=DAVEPMEI_VERSION,
+        host=DAVEPMEI_HOST,
+        routes=["/health","/healthz","/openapi.json","/save_memory","/latest_memory","/get_memory","/privacy_filter"],
+        ts=_now(),
     ), 200
 
-
 @app.get("/healthz")
 def healthz():
-    return health()
-
-@app.get("/healthz")
-def healthz():
+    # Simple liveness probe mirrors /health
     return health()
 
 @app.get("/openapi.json")
@@ -169,7 +164,8 @@ def serve_openapi():
         resp.mimetype = "application/json"
         return resp
     except FileNotFoundError:
-        return jsonify({"openapi":"3.1.0","info":{"title":"PMEi Memory API","version":DAVEPMEI_VERSION},"servers":[{"url":f"https://{DAVEPMEI_HOST}"}]})
+        # minimal fallback to keep tools alive if file missing
+        return jsonify({"openapi":"3.1.0","info":{"title":"PMEi Memory API","version":DAVEPMEI_VERSION},"servers":[{"url":f"https://{DAVEPMEI_HOST}"}]}), 200
 
 @app.post("/save_memory")
 def save_memory():
@@ -240,7 +236,7 @@ def privacy_filter():
         return _json_error(400, str(e))
     return jsonify({"filtered_content": _mask(content)}), 200
 
-# --- optional: canonical host redirect (keeps links tidy)
+# --- Optional: canonical host redirect (keeps links tidy on custom domain)
 @app.before_request
 def _enforce_host_redirect():
     host = request.host.split(":")[0]
