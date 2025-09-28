@@ -1,213 +1,285 @@
+# server.py — PMEi Memory API (Dave)
+# ----------------------------------
+# Minimal, strict, privacy-first memory shard service.
+
 import os
 import re
 import json
 import time
 import threading
-from collections import deque
-from typing import Any, Dict, List
+from typing import Optional, List, Dict, Any
 
-from flask import Flask, request, jsonify, send_from_directory, Response
-from werkzeug.middleware.proxy_fix import ProxyFix
+from flask import Flask, request, jsonify, Response, make_response, send_file
 
-# ------------------------------------------------------------------------------
-# App setup
-# ------------------------------------------------------------------------------
-app = Flask(__name__, static_folder=None)
-app.url_map.strict_slashes = False  # avoid 301/308 redirect surprises
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+# -----------------------
+# Config & global state
+# -----------------------
+app = Flask(__name__)
 
-SERVICE_NAME = "PMEi Memory API (Dave)"
-SERVICE_VERSION = "1.0.1"
-HOST_HINT = os.getenv("DAVEPMEI_HOST", "philmirrorenginei.ai")
+MEMORY_FILE = os.environ.get("MEMORY_FILE", "pmei_memories.jsonl")
+OPENAPI_FILENAME = os.environ.get("OPENAPI_FILENAME", "openapi.json")
+EXPECTED_API_KEY = os.environ.get("MEMORY_API_KEY", "").strip()
+ALLOWED_HOSTS = set(h.strip().lower() for h in os.environ.get("DAVEPMEI_ALLOWED_HOSTS", "").split(",") if h.strip())
 
-# API key config
-API_KEY_ENV_NAME = "MEMORY_API_KEY"
-EXPECTED_API_KEY = os.getenv(API_KEY_ENV_NAME, "")
+LOCK = threading.Lock()
+LATEST: Optional[Dict[str, Any]] = None  # in-process cache of most recent shard
 
-# Memory storage (in-memory + append-only file for simple durability)
-_MEM_LOCK = threading.Lock()
-_MEM: deque = deque(maxlen=10000)  # newest appended to the right
-_MEM_LOG_PATH = os.getenv("MEM_LOG_PATH", "memories.jsonl")  # best-effort
 
-# ------------------------------------------------------------------------------
+# -----------------------
 # Helpers
-# ------------------------------------------------------------------------------
+# -----------------------
+def ts_now_ms() -> int:
+    return int(time.time() * 1000)
 
-def _now_ts() -> int:
-    return int(time.time())
 
-def _require_api_key() -> Response | None:
+def req_id() -> str:
+    return os.urandom(6).hex()
+
+
+def no_store(resp: Response) -> Response:
+    """Disable caching on responses that must be fresh."""
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
+
+
+def get_api_key_from_request() -> str:
     """
-    Enforce presence of a valid API key in the X-API-KEY header.
-    Returns a Flask Response on failure, or None if authorized.
+    Accept either:
+      - X-API-KEY: <key>     (preferred)
+      - MEMORY_API_KEY: <key> (legacy/compat)
     """
+    return (
+        request.headers.get("X-API-KEY")
+        or request.headers.get("x-api-key")
+        or request.headers.get("MEMORY_API_KEY")
+        or request.headers.get("memory_api_key")
+        or ""
+    ).strip()
+
+
+def require_auth() -> Optional[Response]:
     if not EXPECTED_API_KEY:
-        # Service misconfigured – treat as locked
-        return jsonify({"error": "Server missing API key config"}), 500
+        # Service misconfigured — be explicit
+        return jsonify({
+            "error": "Server missing MEMORY_API_KEY",
+            "code": "config_error",
+            "request_id": req_id(),
+        }), 500
 
-    provided = request.headers.get("X-API-KEY") or request.headers.get("MEMORY_API_KEY")
+    provided = get_api_key_from_request()
     if not provided or provided != EXPECTED_API_KEY:
-        return jsonify({"error": "Unauthorized"}), 401
+        return jsonify({
+            "error": "Missing or invalid API key",
+            "code": "unauthorized",
+            "request_id": req_id(),
+        }), 401
+
+    # Optional: host allowlist (mostly for reverse proxy/CDN checks)
+    if ALLOWED_HOSTS:
+        host = (request.headers.get("Host") or "").lower()
+        if host and host not in ALLOWED_HOSTS:
+            return jsonify({
+                "error": "Host not allowed",
+                "code": "forbidden",
+                "request_id": req_id(),
+            }), 403
+
     return None
 
-def _validate_save_payload(data: Dict[str, Any]) -> tuple[bool, str | None]:
-    required_str = ["user_id", "thread_id", "slide_id", "glyph_echo", "seal", "content"]
-    for k in required_str:
-        if k not in data or not isinstance(data[k], str) or data[k] == "":
-            return False, f"Field '{k}' is required and must be a non-empty string."
 
-    if "drift_score" not in data or not isinstance(data["drift_score"], (int, float)):
-        return False, "Field 'drift_score' is required and must be a number."
+def append_jsonl(item: Dict[str, Any]) -> None:
+    """Append one JSON object to the JSONL file, flush and fsync for durability."""
+    with open(MEMORY_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
-    # reject additionalProperties if present and not in known set
-    allowed = set(required_str + ["drift_score"])
-    extras = [k for k in data.keys() if k not in allowed]
-    if extras:
-        # not fatal, but align with 'additionalProperties: false' by rejecting
-        return False, f"Unexpected field(s): {', '.join(sorted(extras))}."
-    return True, None
 
-_EMAIL_RE = re.compile(r"([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})")
-_PHONE_RE = re.compile(r"\+?\d[\d\-\s()]{7,}\d")
+def read_all_jsonl() -> List[Dict[str, Any]]:
+    if not os.path.exists(MEMORY_FILE):
+        return []
+    out: List[Dict[str, Any]] = []
+    with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                out.append(json.loads(s))
+            except Exception:
+                continue
+    return out
 
-def _mask_pii(text: str) -> str:
-    text = _EMAIL_RE.sub(lambda m: f"{m.group(1)[:2]}***@***", text)
-    text = _PHONE_RE.sub(lambda m: "***-PII-REDACTED***", text)
+
+def read_last_line_or_cached() -> Optional[Dict[str, Any]]:
+    global LATEST
+    if LATEST:
+        return LATEST
+    if not os.path.exists(MEMORY_FILE):
+        return None
+    try:
+        with open(MEMORY_FILE, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size == 0:
+                return None
+            # Walk backward to previous newline, then read final line
+            back = 1
+            while size - back >= 0:
+                f.seek(-back, os.SEEK_END)
+                if f.read(1) == b"\n" and back != 1:
+                    break
+                back += 1
+            line = f.readline().decode("utf-8").strip()
+            if not line:
+                return None
+            return json.loads(line)
+    except Exception:
+        return None
+
+
+# --- simple privacy filter (email & phone) ---
+EMAIL_RE = re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[A-Za-z]{2,}\b")
+PHONE_RE = re.compile(r"\b(?:\+?\d[\s-]?){7,15}\b")
+
+
+def mask_pii(text: str) -> str:
+    text = EMAIL_RE.sub(lambda m: "***PII-EMAIL***", text)
+    text = PHONE_RE.sub(lambda m: "***PII-PHONE***", text)
     return text
 
-def _append_memory(item: Dict[str, Any]) -> None:
-    with _MEM_LOCK:
-        _MEM.append(item)
-        try:
-            with open(_MEM_LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps(item, ensure_ascii=False) + "\n")
-        except Exception:
-            # best-effort; ignore file errors in stateless environments
-            pass
 
-def _latest_memory() -> Dict[str, Any] | Dict:
-    with _MEM_LOCK:
-        return dict(_MEM[-1]) if _MEM else {}
-
-def _list_memories(limit: int) -> List[Dict[str, Any]]:
-    with _MEM_LOCK:
-        if limit <= 0:
-            return []
-        # newest are at the right; slice from the end
-        slice_ = list(_MEM)[-limit:]
-        # return newest first
-        slice_.reverse()
-        return slice_
-
-# ------------------------------------------------------------------------------
+# -----------------------
 # Routes
-# ------------------------------------------------------------------------------
-
+# -----------------------
 @app.get("/health")
-def health() -> Response:
+def health():
     return jsonify({
-        "status": "ok",
-        "service": SERVICE_NAME,
-        "version": SERVICE_VERSION,
-        "host": HOST_HINT,
-        "ts": _now_ts(),
+        "ok": True,
+        "service": "Dave PMEi memory API",
+        "ts": ts_now_ms(),
+        "routes": ["/health", "/healthz", "/openapi.json", "/save_memory", "/latest_memory", "/get_memory", "/privacy_filter"],
     })
 
+
 @app.get("/healthz")
-def healthz() -> Response:
+def healthz():
     return health()
 
+
 @app.get("/openapi.json")
-def openapi_json() -> Response:
-    """
-    Serve the OpenAPI file from the same directory as server.py.
-    Ensure openapi.json is committed at the repo root.
-    """
-    try:
-        here = os.path.abspath(os.path.dirname(__file__))
-        return send_from_directory(here, "openapi.json", mimetype="application/json")
-    except Exception as e:
-        return jsonify({"error": f"openapi.json not found: {e}"}), 404
+def openapi_json():
+    if not os.path.exists(OPENAPI_FILENAME):
+        return jsonify({"error": f"{OPENAPI_FILENAME} not found"}), 404
+    # Let clients cache spec for a little while
+    return send_file(OPENAPI_FILENAME, mimetype="application/json")
+
 
 @app.post("/save_memory")
-def save_memory() -> Response:
+def save_memory():
     # Auth
-    unauthorized = _require_api_key()
-    if unauthorized:
-        return unauthorized
-
-    if not request.is_json:
-        return jsonify({"error": "Content-Type must be application/json"}), 400
-
-    data = request.get_json(silent=True) or {}
-    ok, err = _validate_save_payload(data)
-    if not ok:
-        return jsonify({"error": "invalid_payload", "detail": err}), 400
-
-    item = {
-        "user_id": data["user_id"],
-        "thread_id": data["thread_id"],
-        "slide_id": data["slide_id"],
-        "glyph_echo": data["glyph_echo"],
-        "drift_score": float(data["drift_score"]),
-        "seal": data["seal"],
-        "content": data["content"],
-        "ts": _now_ts(),
-    }
-    _append_memory(item)
-    return jsonify({"status": "saved", "slide_id": item["slide_id"]})
-
-@app.get("/latest_memory")
-def latest_memory() -> Response:
-    unauthorized = _require_api_key()
-    if unauthorized:
-        return unauthorized
-
-    item = _latest_memory()
-    # Per spec, either MemoryItem or {}
-    return jsonify(item)
-
-@app.get("/get_memory")
-def get_memory() -> Response:
-    unauthorized = _require_api_key()
-    if unauthorized:
-        return unauthorized
+    auth_err = require_auth()
+    if auth_err:
+        return auth_err
 
     try:
-        limit = int(request.args.get("limit", "10"))
-    except ValueError:
-        return jsonify({"error": "invalid_limit"}), 400
+        payload = request.get_json(force=True, silent=False) or {}
+    except Exception as e:
+        return jsonify({"error": f"invalid json: {e}", "code": "bad_request", "request_id": req_id()}), 400
 
-    # clamp to [1,200]
-    if limit < 1:
-        limit = 1
-    if limit > 200:
-        limit = 200
+    required = ["user_id", "thread_id", "slide_id", "glyph_echo", "drift_score", "seal", "content"]
+    missing = [k for k in required if k not in payload]
+    if missing:
+        return jsonify({"error": f"missing fields: {', '.join(missing)}", "code": "bad_request", "request_id": req_id()}), 400
 
-    items = _list_memories(limit)
-    return jsonify(items)
+    # Stamp and persist
+    shard = dict(payload)
+    shard["ts"] = ts_now_ms()
+    shard["request_id"] = req_id()
+
+    with LOCK:
+        append_jsonl(shard)
+        global LATEST
+        LATEST = shard
+
+    return jsonify({
+        "status": "ok",
+        "slide_id": shard.get("slide_id"),
+        "ts": shard["ts"],
+        "request_id": shard["request_id"],
+    })
+
+
+@app.get("/latest_memory")
+def latest_memory():
+    # Auth
+    auth_err = require_auth()
+    if auth_err:
+        return auth_err
+
+    item = read_last_line_or_cached()
+    return no_store(jsonify(item or {}))
+
+
+@app.get("/get_memory")
+def get_memory():
+    # Auth
+    auth_err = require_auth()
+    if auth_err:
+        return auth_err
+
+    try:
+        limit = int(request.args.get("limit", 10))
+        limit = max(1, min(limit, 200))
+    except Exception:
+        limit = 10
+
+    user_id = request.args.get("user_id")
+    thread_id = request.args.get("thread_id")
+    slide_id = request.args.get("slide_id")
+    seal = request.args.get("seal")
+
+    items = read_all_jsonl()
+
+    # Optional filtering
+    def ok(it: Dict[str, Any]) -> bool:
+        if user_id and it.get("user_id") != user_id:
+            return False
+        if thread_id and it.get("thread_id") != thread_id:
+            return False
+        if slide_id and it.get("slide_id") != slide_id:
+            return False
+        if seal and it.get("seal") != seal:
+            return False
+        return True
+
+    items = [it for it in items if ok(it)]
+    # newest first
+    items = items[-limit:][::-1]
+    return no_store(jsonify(items))
+
 
 @app.post("/privacy_filter")
-def privacy_filter() -> Response:
-    unauthorized = _require_api_key()
-    if unauthorized:
-        return unauthorized
+def privacy_filter():
+    # Auth
+    auth_err = require_auth()
+    if auth_err:
+        return auth_err
 
-    if not request.is_json:
-        return jsonify({"error": "Content-Type must be application/json"}), 400
+    data = request.get_json(force=True, silent=True) or {}
+    content = str(data.get("content", ""))
+    filtered = mask_pii(content)
+    return jsonify({"filtered_content": filtered})
 
-    data = request.get_json(silent=True) or {}
-    content = data.get("content", "")
-    if not isinstance(content, str):
-        return jsonify({"error": "invalid_payload", "detail": "content must be a string"}), 400
 
-    masked = _mask_pii(content)
-    return jsonify({"filtered_content": masked})
-
-# ------------------------------------------------------------------------------
-# WSGI entrypoint
-# ------------------------------------------------------------------------------
+# -----------------------
+# Entrypoint (optional)
+# -----------------------
 if __name__ == "__main__":
-    # Useful for local testing: MEMORY_API_KEY must be set.
-    port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    # Local dev: `python server.py`
+    # For Render/Prod use gunicorn:
+    #   gunicorn server:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-class gthread --timeout 60
+    port = int(os.environ.get("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
