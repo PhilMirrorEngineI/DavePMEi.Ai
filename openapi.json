@@ -6,15 +6,12 @@
     "description": "Lawful memory shards for Dave/PMEi. Minimal, strict, privacy-first."
   },
   "servers": [
-    { "url": "https://www.philmirrorenginei.ai" }
+    { "url": "https://www.philmirrorenginei.ai" },
+    { "url": "https://philmirrorenginei.ai" }
   ],
   "components": {
     "securitySchemes": {
-      "MemoryKey": {
-        "type": "apiKey",
-        "in": "header",
-        "name": "X-API-KEY"
-      }
+      "MemoryKey": { "type": "apiKey", "in": "header", "name": "X-API-KEY" }
     },
     "schemas": {
       "SaveMemoryRequest": {
@@ -42,10 +39,9 @@
           "drift_score": { "type": "number" },
           "seal": { "type": "string" },
           "content": { "type": "string" },
-          "ts": { "type": "integer", "format": "int64" },
-          "request_id": { "type": "string" }
+          "ts": { "type": "integer", "format": "int64" }
         },
-        "required": ["user_id","thread_id","slide_id","glyph_echo","drift_score","seal","content","ts","request_id"]
+        "required": ["user_id","thread_id","slide_id","glyph_echo","drift_score","seal","content","ts"]
       },
       "MemoryList": {
         "type": "array",
@@ -64,8 +60,7 @@
           "drift_score": { "type": "number" },
           "seal": { "type": "string" },
           "content": { "type": "string" },
-          "ts": { "type": "integer", "format": "int64" },
-          "request_id": { "type": "string" }
+          "ts": { "type": "integer", "format": "int64" }
         }
       },
       "SaveMemoryResponse": {
@@ -110,46 +105,35 @@
         "summary": "Health check",
         "operationId": "health_check",
         "security": [],
-        "responses": {
-          "200": { "description": "OK" }
-        }
+        "responses": { "200": { "description": "OK" } }
       }
     },
     "/healthz": {
       "get": {
-        "summary": "Alias health check",
+        "summary": "Liveness check",
         "operationId": "healthz",
         "security": [],
-        "responses": {
-          "200": { "description": "OK" }
-        }
+        "responses": { "200": { "description": "OK" } }
       }
     },
     "/openapi.json": {
       "get": {
-        "summary": "Return the API schema",
+        "summary": "Return OpenAPI schema",
         "operationId": "openapi",
         "security": [],
-        "responses": {
-          "200": { "description": "OpenAPI document" }
-        }
+        "responses": { "200": { "description": "Schema" } }
       }
     },
     "/save_memory": {
       "post": {
-        "summary": "Save a compressed memory shard",
+        "summary": "Save a memory shard",
         "operationId": "save_memory",
         "requestBody": {
           "required": true,
-          "content": {
-            "application/json": { "schema": { "$ref": "#/components/schemas/SaveMemoryRequest" } }
-          }
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SaveMemoryRequest" } } }
         },
         "responses": {
-          "200": {
-            "description": "Saved",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SaveMemoryResponse" } } }
-          },
+          "200": { "description": "Saved", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SaveMemoryResponse" } } } },
           "400": { "description": "Bad request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
           "401": { "description": "Unauthorized", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
