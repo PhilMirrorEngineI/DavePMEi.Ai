@@ -22,7 +22,7 @@ from flask import Flask, request, jsonify, Response, send_file
 app = Flask(__name__)
 
 # Storage/config
-MEMORY_FILE=/data/memory.json")
+MEMORY_FILE=/data/memory.json
 OPENAPI_FILENAME = os.environ.get("OPENAPI_FILENAME", "openapi.json")
 EXPECTED_API_KEY = os.environ.get("MEMORY_API_KEY", "").strip()
 ALLOWED_HOSTS = set(h.strip().lower() for h in os.environ.get("DAVEPMEI_ALLOWED_HOSTS", "").split(",") if h.strip())
