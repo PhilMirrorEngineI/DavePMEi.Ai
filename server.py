@@ -140,15 +140,21 @@ def _validate_save_payload(d: Dict[str, Any]):
 # Routes
 # ---------------------------
 @app.get("/health")
+@app.route("/health", methods=["GET"])
 def health():
     return jsonify(
-        ok=True,
-        version=DAVEPMEI_VERSION,
-        service="Dave PMEi memory API",
-        host=DAVEPMEI_HOST,
-        routes=["/health","/healthz","/openapi.json","/save_memory","/latest_memory","/get_memory","/privacy_filter"],
-        ts=_now(),
-    )
+        status="ok",
+        service="DavePMEi.Ai",
+        version=os.getenv("DAVEPMEI_VERSION", "unknown"),
+        host=os.getenv("DAVEPMEI_HOST", "unset"),
+        routes=["/health", "/healthz", "/openapi.json", "/save_memory", "/latest_memory", "/get_memory", "/privacy_filter"],
+        ts=_now()
+    ), 200
+
+
+@app.get("/healthz")
+def healthz():
+    return health()
 
 @app.get("/healthz")
 def healthz():
