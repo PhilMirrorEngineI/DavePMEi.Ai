@@ -1,16 +1,17 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "PMEi Memory API",
-    "version": "1.0.2",
-    "description": "Secure, lawful memory shards for Dave/PMEi. Strict, privacy-first."
+    "title": "PMEi Memory API (Dave)",
+    "version": "1.0.1",
+    "description": "Secure, lawful memory shards for PhilMirrorEnginei.ai (PMEi)."
   },
   "servers": [
+    { "url": "https://www.philmirrorenginei.ai" },
     { "url": "https://philmirrorenginei.ai" }
   ],
   "components": {
     "securitySchemes": {
-      "ApiKeyAuth": {
+      "ApiKey": {
         "type": "apiKey",
         "in": "header",
         "name": "X-API-KEY"
@@ -28,7 +29,16 @@
           "seal": { "type": "string" },
           "content": { "type": "string" }
         },
-        "required": ["user_id","thread_id","slide_id","glyph_echo","drift_score","seal","content"]
+        "required": [
+          "user_id",
+          "thread_id",
+          "slide_id",
+          "glyph_echo",
+          "drift_score",
+          "seal",
+          "content"
+        ],
+        "additionalProperties": false
       },
       "MemoryItem": {
         "type": "object",
@@ -41,7 +51,18 @@
           "seal": { "type": "string" },
           "content": { "type": "string" },
           "ts": { "type": "integer", "description": "Unix timestamp (seconds)" }
-        }
+        },
+        "required": [
+          "user_id",
+          "thread_id",
+          "slide_id",
+          "glyph_echo",
+          "drift_score",
+          "seal",
+          "content",
+          "ts"
+        ],
+        "additionalProperties": false
       },
       "MemoryList": {
         "type": "array",
@@ -52,35 +73,36 @@
         "properties": {
           "status": { "type": "string", "example": "saved" },
           "slide_id": { "type": "string" }
-        }
+        },
+        "required": ["status", "slide_id"],
+        "additionalProperties": false
+      },
+      "LatestMemoryResponse": {
+        "oneOf": [
+          { "$ref": "#/components/schemas/MemoryItem" },
+          { "type": "object", "additionalProperties": false }
+        ],
+        "description": "Either a MemoryItem or empty object when none exists."
       },
       "PrivacyFilterRequest": {
         "type": "object",
         "properties": {
           "content": { "type": "string" }
         },
-        "required": ["content"]
+        "required": ["content"],
+        "additionalProperties": false
       },
       "PrivacyFilterResponse": {
         "type": "object",
         "properties": {
-          "filtered": { "type": "string" }
-        }
-      },
-      "HealthResponse": {
-        "type": "object",
-        "properties": {
-          "ok": { "type": "boolean" },
-          "version": { "type": "string" },
-          "service": { "type": "string" },
-          "host": { "type": "string" },
-          "routes": { "type": "array", "items": { "type": "string" } },
-          "ts": { "type": "integer" }
-        }
+          "filtered_content": { "type": "string" }
+        },
+        "required": ["filtered_content"],
+        "additionalProperties": false
       }
     }
   },
-  "security": [{ "ApiKeyAuth": [] }],
+  "security": [{ "ApiKey": [] }],
   "paths": {
     "/health": {
       "get": {
@@ -89,19 +111,24 @@
         "security": [],
         "responses": {
           "200": {
-            "description": "Service status",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/HealthResponse" }
-              }
-            }
+            "description": "OK"
           }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "summary": "Liveness check",
+        "operationId": "healthz",
+        "security": [],
+        "responses": {
+          "200": { "description": "OK" }
         }
       }
     },
     "/save_memory": {
       "post": {
-        "summary": "Save a compressed memory shard",
+        "summary": "Save a memory shard",
         "operationId": "save_memory",
         "requestBody": {
           "required": true,
@@ -121,25 +148,20 @@
             }
           },
           "400": { "description": "Bad request" },
-          "401": { "description": "Unauthorized" }
+          "401": { "description": "Unauthorized (missing or invalid API key)" }
         }
       }
     },
     "/latest_memory": {
       "get": {
-        "summary": "Return the most recent memory (or empty object)",
+        "summary": "Return the most recent memory or {}",
         "operationId": "get_latest_memory",
         "responses": {
           "200": {
-            "description": "Latest memory or {}",
+            "description": "Latest memory (or empty object)",
             "content": {
               "application/json": {
-                "schema": {
-                  "oneOf": [
-                    { "$ref": "#/components/schemas/MemoryItem" },
-                    { "type": "object", "additionalProperties": false }
-                  ]
-                }
+                "schema": { "$ref": "#/components/schemas/LatestMemoryResponse" }
               }
             }
           },
@@ -155,7 +177,12 @@
           {
             "name": "limit",
             "in": "query",
-            "schema": { "type": "integer", "default": 10, "minimum": 1, "maximum": 200 }
+            "schema": {
+              "type": "integer",
+              "default": 10,
+              "minimum": 1,
+              "maximum": 200
+            }
           }
         ],
         "responses": {
@@ -173,7 +200,7 @@
     },
     "/privacy_filter": {
       "post": {
-        "summary": "Filter sensitive/PII data before saving",
+        "summary": "Filter sensitive/PII data from input before saving",
         "operationId": "privacy_filter",
         "requestBody": {
           "required": true,
