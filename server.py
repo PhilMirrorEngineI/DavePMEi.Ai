@@ -1,422 +1,224 @@
 # server.py — PMEi Memory API (Dave)
-# ----------------------------------
-# Minimal, strict, privacy-first memory shard service with:
-# - Nightly backups (JSONL snapshots)
-# - /metrics endpoint
-# - Simple per-IP rate limiting
+# Minimal, strict, privacy-first memory shard service with JSON-file storage on a Render Disk.
 
-import os
-import re
-import json
-import time
-import shutil
-import threading
-from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict, Any
-
+import os, re, json, time, uuid, threading, shutil
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional
 from flask import Flask, request, jsonify, Response, send_file
 
-# -----------------------
-# Config & global state
-# -----------------------
+# -------------------------------
+# App & configuration
+# -------------------------------
 app = Flask(__name__)
 
-# Storage/config
-MEMORY_FILE=/data/memory.json
-OPENAPI_FILENAME = os.environ.get("OPENAPI_FILENAME", "openapi.json")
-EXPECTED_API_KEY = os.environ.get("MEMORY_API_KEY", "").strip()
-ALLOWED_HOSTS = set(h.strip().lower() for h in os.environ.get("DAVEPMEI_ALLOWED_HOSTS", "").split(",") if h.strip())
+# Storage / config (env overrides; defaults point at your Render Disk)
+MEMORY_FILE       = os.environ.get("MEMORY_FILE", "/data/memory.json")
+OPENAPI_FILENAME  = os.environ.get("OPENAPI_FILENAME", "openapi.json")
+EXPECTED_API_KEY  = os.environ.get("MEMORY_API_KEY", "").strip()
+ALLOWED_HOSTS     = {h.strip().lower() for h in os.environ.get("DAVEPMEI_ALLOWED_HOSTS", "").split(",") if h.strip()}
 
-# Backups
-BACKUP_DIR = os.environ.get("BACKUP_DIR", "backups")
-# Hour (UTC) to run nightly backup; default 03:00 UTC
-BACKUP_HOUR_UTC = int(os.environ.get("BACKUP_HOUR_UTC", "3"))
-
-# Rate limiting (per-IP)
 RATE_LIMIT_WINDOW_SEC = int(os.environ.get("RATE_LIMIT_WINDOW_SEC", "60"))
-RATE_LIMIT_MAX = int(os.environ.get("RATE_LIMIT_MAX", "120"))
+RATE_LIMIT_MAX        = int(os.environ.get("RATE_LIMIT_MAX", "120"))
 
-LOCK = threading.Lock()
-LATEST: Optional[Dict[str, Any]] = None  # in-process cache of most recent shard
+# Simple in-process locks/state
+_file_lock = threading.Lock()
+_rate_lock = threading.Lock()
+_rate_window: Dict[str, List[float]] = {}
 
-# Metrics (very simple in-memory counters)
-METRICS = {
-    "started_ts": int(time.time()),
-    "total_requests": 0,
-    "saved_memories": 0,
-    "errors_4xx": 0,
-    "errors_5xx": 0,
-    "rate_limited": 0,
-}
+# Ensure storage dir exists
+os.makedirs(os.path.dirname(MEMORY_FILE) or ".", exist_ok=True)
 
-# Rate-limit buckets: ip -> list[timestamps]
-RL_BUCKETS: Dict[str, List[float]] = {}
-RL_LOCK = threading.Lock()
+# Initialize file if not present
+if not os.path.exists(MEMORY_FILE):
+    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+        json.dump([], f)
 
+def _now_ts() -> int:
+    return int(time.time())
 
-# -----------------------
-# Helpers
-# -----------------------
-def ts_now_ms() -> int:
-    return int(time.time() * 1000)
+def _read_all() -> List[Dict[str, Any]]:
+    with _file_lock:
+        try:
+            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+                return []
+        except FileNotFoundError:
+            return []
+        except json.JSONDecodeError:
+            return []
 
+def _write_all(items: List[Dict[str, Any]]) -> None:
+    tmp = MEMORY_FILE + ".tmp"
+    with _file_lock:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False)
+        shutil.move(tmp, MEMORY_FILE)
 
-def req_id() -> str:
-    return os.urandom(6).hex()
+def _client_ip() -> str:
+    return request.headers.get("X-Forwarded-For", request.remote_addr or "0.0.0.0").split(",")[0].strip()
 
+def _rate_limit_ok() -> bool:
+    now = time.time()
+    key = _client_ip()
+    with _rate_lock:
+        window = _rate_window.setdefault(key, [])
+        # drop old
+        cutoff = now - RATE_LIMIT_WINDOW_SEC
+        _rate_window[key] = [t for t in window if t >= cutoff]
+        if len(_rate_window[key]) >= RATE_LIMIT_MAX:
+            return False
+        _rate_window[key].append(now)
+        return True
 
-def no_store(resp: Response) -> Response:
-    """Disable caching on responses that must be fresh."""
-    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    resp.headers["Pragma"] = "no-cache"
-    resp.headers["Expires"] = "0"
-    return resp
-
-
-def get_api_key_from_request() -> str:
-    """
-    Accept either:
-      - X-API-KEY: <key>      (preferred)
-      - MEMORY_API_KEY: <key> (legacy/compat)
-    """
-    return (
-        request.headers.get("X-API-KEY")
-        or request.headers.get("x-api-key")
-        or request.headers.get("MEMORY_API_KEY")
-        or request.headers.get("memory_api_key")
-        or ""
-    ).strip()
-
-
-def require_auth() -> Optional[Response]:
-    if not EXPECTED_API_KEY:
-        # Service misconfigured — be explicit
-        return jsonify({
-            "error": "Server missing MEMORY_API_KEY",
-            "code": "config_error",
-            "request_id": req_id(),
-        }), 500
-
-    provided = get_api_key_from_request()
-    if not provided or provided != EXPECTED_API_KEY:
-        return jsonify({
-            "error": "Missing or invalid API key",
-            "code": "unauthorized",
-            "request_id": req_id(),
-        }), 401
-
-    # Optional: host allowlist (mostly for reverse proxy/CDN checks)
+def _need_auth() -> Optional[Response]:
+    # allow health & openapi without auth
+    if request.endpoint in ("health", "healthz", "openapi_json"):
+        return None
+    # allowed host (optional)
     if ALLOWED_HOSTS:
-        host = (request.headers.get("Host") or "").lower()
-        if host and host not in ALLOWED_HOSTS:
-            return jsonify({
-                "error": "Host not allowed",
-                "code": "forbidden",
-                "request_id": req_id(),
-            }), 403
-
+        host = (request.host or "").split(":")[0].lower()
+        if host not in ALLOWED_HOSTS:
+            return _err("forbidden host", "forbidden", 403)
+    # api key
+    key = request.headers.get("X-API-KEY", "").strip()
+    if not EXPECTED_API_KEY or key != EXPECTED_API_KEY:
+        return _err("Missing or invalid API key", "unauthorized", 401)
     return None
 
+@app.before_request
+def _gate():
+    if not _rate_limit_ok():
+        return _err("rate limit", "too_many_requests", 429)
+    auth = _need_auth()
+    if auth is not None:
+        return auth
 
-def append_jsonl(item: Dict[str, Any]) -> None:
-    """Append one JSON object to the JSONL file, flush and fsync for durability."""
-    with open(MEMORY_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(item, ensure_ascii=False) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
+def _err(msg: str, code: str, status: int):
+    rid = uuid.uuid4().hex
+    return jsonify({"error": msg, "code": code, "request_id": rid}), status
 
+# -------------------------------
+# Privacy filter (very minimal)
+# -------------------------------
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+PHONE_RE = re.compile(r"\+?\d[\d \-]{7,}\d")
 
-def read_all_jsonl() -> List[Dict[str, Any]]:
-    if not os.path.exists(MEMORY_FILE):
-        return []
-    out: List[Dict[str, Any]] = []
-    with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            s = line.strip()
-            if not s:
-                continue
-            try:
-                out.append(json.loads(s))
-            except Exception:
-                continue
-    return out
-
-
-def read_last_line_or_cached() -> Optional[Dict[str, Any]]:
-    global LATEST
-    if LATEST:
-        return LATEST
-    if not os.path.exists(MEMORY_FILE):
-        return None
-    try:
-        with open(MEMORY_FILE, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            if size == 0:
-                return None
-            # Walk backward to previous newline, then read final line
-            back = 1
-            while size - back >= 0:
-                f.seek(-back, os.SEEK_END)
-                if f.read(1) == b"\n" and back != 1:
-                    break
-                back += 1
-            line = f.readline().decode("utf-8").strip()
-            if not line:
-                return None
-            return json.loads(line)
-    except Exception:
-        return None
-
-
-# --- simple privacy filter (email & phone) ---
-EMAIL_RE = re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[A-Za-z]{2,}\b")
-PHONE_RE = re.compile(r"\b(?:\+?\d[\s-]?){7,15}\b")
-
-
-def mask_pii(text: str) -> str:
-    text = EMAIL_RE.sub(lambda m: "***PII-EMAIL***", text)
-    text = PHONE_RE.sub(lambda m: "***PII-PHONE***", text)
+def privacy_mask(text: str) -> str:
+    text = EMAIL_RE.sub("***-PII-REDACTED***", text)
+    text = PHONE_RE.sub("***-PII-REDACTED***", text)
     return text
 
-
-# -----------------------
-# Rate limiting hooks
-# -----------------------
-@app.before_request
-def _before_request_metrics_and_rl():
-    # metrics: count request
-    METRICS["total_requests"] += 1
-
-    # allow-list some public endpoints from RL
-    path = request.path or ""
-    if path in ("/health", "/healthz", "/openapi.json"):
-        return
-
-    # very simple sliding-window per-IP limiter
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
-    now = time.time()
-    with RL_LOCK:
-        bucket = RL_BUCKETS.get(ip)
-        if bucket is None:
-            bucket = []
-            RL_BUCKETS[ip] = bucket
-        # drop timestamps outside window
-        cutoff = now - RATE_LIMIT_WINDOW_SEC
-        i = 0
-        while i < len(bucket) and bucket[i] < cutoff:
-            i += 1
-        if i:
-            del bucket[:i]
-        # check capacity
-        if len(bucket) >= RATE_LIMIT_MAX:
-            METRICS["rate_limited"] += 1
-            return jsonify({
-                "error": "rate_limited",
-                "code": "too_many_requests",
-                "request_id": req_id(),
-                "window_sec": RATE_LIMIT_WINDOW_SEC,
-                "limit": RATE_LIMIT_MAX
-            }), 429
-        # record
-        bucket.append(now)
-
-
-@app.after_request
-def _after_request_status_counts(resp: Response):
-    try:
-        code = int(resp.status_code)
-        if 400 <= code < 500:
-            METRICS["errors_4xx"] += 1
-        elif code >= 500:
-            METRICS["errors_5xx"] += 1
-    except Exception:
-        pass
-    return resp
-
-
-# -----------------------
-# Nightly backup daemon
-# -----------------------
-def _seconds_until_next_backup_utc(hour_utc: int) -> float:
-    now = datetime.now(timezone.utc)
-    target = now.replace(hour=hour_utc, minute=0, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    return (target - now).total_seconds()
-
-
-def _run_backup_daemon():
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-    while True:
-        try:
-            # sleep until the next scheduled time (UTC hour)
-            time.sleep(_seconds_until_next_backup_utc(BACKUP_HOUR_UTC))
-
-            # build snapshot filename
-            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            dst = os.path.join(BACKUP_DIR, f"backup_{stamp}.jsonl")
-
-            # perform copy under lock to avoid partial line
-            with LOCK:
-                if os.path.exists(MEMORY_FILE):
-                    shutil.copyfile(MEMORY_FILE, dst)
-        except Exception:
-            # never crash the daemon; wait 60s and try again
-            time.sleep(60)
-
-
-# fire-and-forget background thread
-threading.Thread(target=_run_backup_daemon, name="backup-daemon", daemon=True).start()
-
-
-# -----------------------
+# -------------------------------
 # Routes
-# -----------------------
+# -------------------------------
 @app.get("/health")
 def health():
     return jsonify({
         "ok": True,
         "service": "Dave PMEi memory API",
-        "ts": ts_now_ms(),
-        "routes": ["/health", "/healthz", "/openapi.json", "/save_memory", "/latest_memory", "/get_memory", "/privacy_filter", "/metrics"],
-        "rate_limit_window_sec": RATE_LIMIT_WINDOW_SEC,
-        "rate_limit_max": RATE_LIMIT_MAX,
+        "version": "1.0.3",
+        "host": request.host,
+        "routes": ["/health", "/healthz", "/openapi.json", "/save_memory", "/latest_memory", "/get_memory", "/privacy_filter"],
+        "ts": _now_ts(),
     })
-
 
 @app.get("/healthz")
 def healthz():
     return health()
 
-
 @app.get("/openapi.json")
 def openapi_json():
+    # serve the checked-in file (keeps the Actions schema aligned)
     if not os.path.exists(OPENAPI_FILENAME):
-        return jsonify({"error": f"{OPENAPI_FILENAME} not found"}), 404
-    # Spec can be cached by clients
+        return _err("openapi not found", "not_found", 404)
     return send_file(OPENAPI_FILENAME, mimetype="application/json")
-
-
-@app.get("/metrics")
-def metrics():
-    # Simple read-only metrics (public). Add auth if you prefer.
-    uptime = int(time.time()) - METRICS["started_ts"]
-    data = {
-        "uptime_seconds": uptime,
-        "total_requests": METRICS["total_requests"],
-        "saved_memories": METRICS["saved_memories"],
-        "errors_4xx": METRICS["errors_4xx"],
-        "errors_5xx": METRICS["errors_5xx"],
-        "rate_limited": METRICS["rate_limited"],
-        "ts": ts_now_ms()
-    }
-    return jsonify(data)
-
 
 @app.post("/save_memory")
 def save_memory():
-    # Auth
-    auth_err = require_auth()
-    if auth_err:
-        return auth_err
-
     try:
-        payload = request.get_json(force=True, silent=False) or {}
-    except Exception as e:
-        return jsonify({"error": f"invalid json: {e}", "code": "bad_request", "request_id": req_id()}), 400
+        data = request.get_json(force=True, silent=False) or {}
+    except Exception:
+        return _err("invalid json", "bad_request", 400)
 
     required = ["user_id", "thread_id", "slide_id", "glyph_echo", "drift_score", "seal", "content"]
-    missing = [k for k in required if k not in payload]
+    missing = [k for k in required if k not in data]
     if missing:
-        return jsonify({"error": f"missing fields: {', '.join(missing)}", "code": "bad_request", "request_id": req_id()}), 400
+        return _err(f"missing fields: {', '.join(missing)}", "bad_request", 400)
 
-    # Stamp and persist
-    shard = dict(payload)
-    shard["ts"] = ts_now_ms()
-    shard["request_id"] = req_id()
+    # coerce types
+    try:
+        drift = float(data["drift_score"])
+    except Exception:
+        return _err("drift_score must be a number", "bad_request", 400)
 
-    with LOCK:
-        append_jsonl(shard)
-        global LATEST
-        LATEST = shard
-        METRICS["saved_memories"] += 1
+    item = {
+        "user_id":   str(data["user_id"]),
+        "thread_id": str(data["thread_id"]),
+        "slide_id":  str(data["slide_id"]),
+        "glyph_echo":str(data["glyph_echo"]),
+        "drift_score": drift,
+        "seal":     str(data["seal"]),
+        "content":  str(data["content"]),
+        "ts":       _now_ts()
+    }
+
+    items = _read_all()
+    items.append(item)              # append; newest is last
+    _write_all(items)
 
     return jsonify({
         "status": "ok",
-        "slide_id": shard.get("slide_id"),
-        "ts": shard["ts"],
-        "request_id": shard["request_id"],
+        "slide_id": item["slide_id"],
+        "ts": item["ts"],
+        "request_id": uuid.uuid4().hex
     })
-
 
 @app.get("/latest_memory")
 def latest_memory():
-    # Auth
-    auth_err = require_auth()
-    if auth_err:
-        return auth_err
-
-    item = read_last_line_or_cached()
-    return no_store(jsonify(item or {}))
-
+    items = _read_all()
+    if not items:
+        return jsonify({})
+    return jsonify(items[-1])
 
 @app.get("/get_memory")
 def get_memory():
-    # Auth
-    auth_err = require_auth()
-    if auth_err:
-        return auth_err
-
+    # filters: user_id, thread_id, slide_id, seal  | limit
+    user_id   = request.args.get("user_id")
+    thread_id = request.args.get("thread_id")
+    slide_id  = request.args.get("slide_id")
+    seal      = request.args.get("seal")
     try:
-        limit = int(request.args.get("limit", 10))
+        limit = int(request.args.get("limit", "10"))
         limit = max(1, min(limit, 200))
     except Exception:
         limit = 10
 
-    user_id = request.args.get("user_id")
-    thread_id = request.args.get("thread_id")
-    slide_id = request.args.get("slide_id")
-    seal = request.args.get("seal")
+    items = _read_all()
 
-    items = read_all_jsonl()
-
-    # Optional filtering
-    def ok(it: Dict[str, Any]) -> bool:
-        if user_id and it.get("user_id") != user_id:
-            return False
-        if thread_id and it.get("thread_id") != thread_id:
-            return False
-        if slide_id and it.get("slide_id") != slide_id:
-            return False
-        if seal and it.get("seal") != seal:
-            return False
+    def keep(it):
+        if user_id   and it.get("user_id")   != user_id:   return False
+        if thread_id and it.get("thread_id") != thread_id: return False
+        if slide_id  and it.get("slide_id")  != slide_id:  return False
+        if seal      and it.get("seal")      != seal:      return False
         return True
 
-    items = [it for it in items if ok(it)]
+    filtered = [it for it in items if keep(it)]
     # newest first
-    items = items[-limit:][::-1]
-    return no_store(jsonify(items))
-
+    filtered = list(reversed(filtered))[:limit]
+    return jsonify(filtered)
 
 @app.post("/privacy_filter")
-def privacy_filter():
-    # Auth
-    auth_err = require_auth()
-    if auth_err:
-        return auth_err
+def run_privacy_filter():
+    try:
+        data = request.get_json(force=True, silent=False) or {}
+    except Exception:
+        return _err("invalid json", "bad_request", 400)
 
-    data = request.get_json(force=True, silent=True) or {}
     content = str(data.get("content", ""))
-    filtered = mask_pii(content)
-    return jsonify({"filtered_content": filtered})
+    return jsonify({"filtered_content": privacy_mask(content)})
 
-
-# -----------------------
-# Entrypoint (local dev)
-# -----------------------
+# Entrypoint
 if __name__ == "__main__":
-    # For Render/Prod use gunicorn:
-    #   web: gunicorn server:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-class gthread --timeout 60
-    port = int(os.environ.get("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
