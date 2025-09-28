@@ -1,4 +1,4 @@
-# server.py — Dave/PMEi (Flask) render service
+# server.py — Dave / PMEi Flask service (Render-ready)
 # routes: /health, /healthz, /openapi.json, /save_memory, /latest_memory, /get_memory, /privacy_filter
 
 from __future__ import annotations
@@ -10,46 +10,45 @@ from flask import Flask, request, jsonify, make_response, redirect
 from werkzeug.exceptions import BadRequest
 
 # ---------------------------
-# Config (env) – PMEi names
+# Config (env)
 # ---------------------------
-APP_PORT            = int(os.getenv("PORT", "8080"))
-DAVEPMEI_VERSION    = os.getenv("DAVEPMEI_VERSION", "1.0.1")
-DAVEPMEI_HOST       = os.getenv("DAVEPMEI_HOST", "philmirrorenginei.ai")
-DAVEPMEI_HOSTS      = [h.strip() for h in os.getenv("DAVEPMEI_HOSTS", f"{DAVEPMEI_HOST},www.{DAVEPMEI_HOST}").split(",") if h.strip()]
-DAVEPMEI_ALLOWED    = [h.strip() for h in os.getenv("DAVEPMEI_ALLOWED_HOSTS", ",".join(DAVEPMEI_HOSTS)).split(",") if h.strip()]
+APP_PORT         = int(os.getenv("PORT", "8080"))
+DAVEPMEI_VERSION = os.getenv("DAVEPMEI_VERSION", "1.0.2")
+DAVEPMEI_HOST    = os.getenv("DAVEPMEI_HOST", "philmirrorenginei.ai")
+DAVEPMEI_HOSTS   = [h.strip() for h in os.getenv("DAVEPMEI_HOSTS", f"{DAVEPMEI_HOST},www.{DAVEPMEI_HOST}").split(",") if h.strip()]
+DAVEPMEI_ALLOWED = [h.strip() for h in os.getenv("DAVEPMEI_ALLOWED_HOSTS", ",".join(DAVEPMEI_HOSTS)).split(",") if h.strip()]
 
-MEMORY_API_KEY      = os.getenv("MEMORY_API_KEY", "")
-MEMORY_FILE         = os.getenv("MEMORY_FILE", "pmei_memories.jsonl")
-OPENAPI_FILENAME    = os.getenv("OPENAPI_FILENAME", "openapi.json")
+MEMORY_API_KEY   = os.getenv("MEMORY_API_KEY", "")
+MEMORY_FILE      = os.getenv("MEMORY_FILE", "pmei_memories.jsonl")
+OPENAPI_FILENAME = os.getenv("OPENAPI_FILENAME", "openapi.json")
 
 # ---------------------------
 # App
 # ---------------------------
 app = Flask(__name__)
 app.url_map.strict_slashes = False
-
 _write_lock = threading.Lock()
 
 # ---------------------------
-# Small helpers
+# Helpers
 # ---------------------------
 def _req_id() -> str:
     return request.headers.get("X-Request-ID", str(uuid.uuid4()))
 
+def _now() -> int:
+    return int(time.time())
+
 def _incoming_key() -> Optional[str]:
-    # Accept common spellings so client/editor quirks don’t 403
+    # accept both header spellings (covers Actions/editor quirks)
     return (
         request.headers.get("X-API-KEY")
         or request.headers.get("X_API_KEY")
         or request.headers.get("MEMORY_API_KEY")
-        or request.args.get("key")
+        or request.args.get("key")  # last resort for manual tests
     )
 
-def _now() -> int:
-    return int(time.time())
-
-def _json_error(code: int, msg: str, *, req_id: Optional[str] = None):
-    rid = req_id or _req_id()
+def _json_error(code: int, msg: str):
+    rid = _req_id()
     resp = jsonify({"error": msg, "code": str(code), "request_id": rid})
     resp.status_code = code
     resp.headers["X-Request-ID"] = rid
@@ -57,10 +56,8 @@ def _json_error(code: int, msg: str, *, req_id: Optional[str] = None):
 
 def _add_common_headers(resp):
     resp.headers.setdefault("X-Request-ID", _req_id())
-    # CORS: useful for testing from tools
     resp.headers.setdefault("Access-Control-Allow-Origin", "*")
     resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, X-API-KEY, MEMORY_API_KEY, X-Request-ID")
-    # Cache: schema can be cached a bit; others no-store
     if request.path == "/openapi.json":
         resp.headers.setdefault("Cache-Control", "public, max-age=600, immutable")
     else:
@@ -78,13 +75,11 @@ OPEN_ROUTES = {"/health", "/healthz", "/openapi.json"}
 
 @app.before_request
 def _gate():
-    # Allow health/spec without key
+    # allow health & schema without key
     if request.path in OPEN_ROUTES:
         return None
-    # Require key for everything else
     if not MEMORY_API_KEY:
-        # Misconfig safety: if key not set on server, refuse writes
-        return _json_error(500, "Server is missing MEMORY_API_KEY")
+        return _json_error(500, "Server missing MEMORY_API_KEY")
     key = _incoming_key()
     if not key or key != MEMORY_API_KEY:
         return _json_error(403, "forbidden")
@@ -115,7 +110,6 @@ def _iter_jsonl() -> Iterable[Dict[str, Any]]:
         return
 
 def _apply_filters(items: Iterable[Dict[str, Any]]) -> Iterable[Dict[str, Any]]:
-    # Optional filters by query params
     q_user   = request.args.get("user_id")
     q_thread = request.args.get("thread_id")
     q_slide  = request.args.get("slide_id")
@@ -138,7 +132,6 @@ def _validate_save_payload(d: Dict[str, Any]):
         raise BadRequest(f"Missing fields: {', '.join(missing)}")
     if not isinstance(d.get("drift_score"), (int, float)):
         raise BadRequest("drift_score must be a number.")
-    # light-type checks
     for k in ["user_id","thread_id","slide_id","glyph_echo","seal","content"]:
         if not isinstance(d.get(k), str) or not d[k]:
             raise BadRequest(f"{k} must be a non-empty string.")
@@ -170,7 +163,6 @@ def serve_openapi():
         resp.mimetype = "application/json"
         return resp
     except FileNotFoundError:
-        # Minimal inline fallback to avoid 404s during early boots
         return jsonify({"openapi":"3.1.0","info":{"title":"PMEi Memory API","version":DAVEPMEI_VERSION},"servers":[{"url":f"https://{DAVEPMEI_HOST}"}]})
 
 @app.post("/save_memory")
@@ -220,7 +212,7 @@ def get_memory():
     items.sort(key=lambda x: int(x.get("ts", 0)), reverse=True)
     return jsonify(items[:limit]), 200
 
-# Simple PII filter (emails / phones masked) – deterministic & safe
+# --- Privacy filter (mask emails/phones) ---
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 _PHONE_RE = re.compile(r"\b(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{2,4}\)?[-.\s]?)?\d{3,4}[-.\s]?\d{4}\b")
 
@@ -242,16 +234,15 @@ def privacy_filter():
         return _json_error(400, str(e))
     return jsonify({"filtered_content": _mask(content)}), 200
 
-# Optional: canonical host redirect (keeps links tidy)
+# --- optional: canonical host redirect (keeps links tidy)
 @app.before_request
 def _enforce_host_redirect():
     host = request.host.split(":")[0]
-    if DAVEPMEI_ALLOWED and host not in DAVEPMEI_ALLOWED:
-        # redirect to primary
+    if DAVEPMEI_ALLOWED and host not in DAVEPMEI_ALLOWED and request.path not in OPEN_ROUTES:
         parts = urlsplit(request.url)
         target = urlunsplit(("https", DAVEPMEI_HOST, parts.path, parts.query, parts.fragment))
         return redirect(target, code=308)
 
-# Entry (Render runs via Procfile)
+# Entry
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=APP_PORT, debug=False)
