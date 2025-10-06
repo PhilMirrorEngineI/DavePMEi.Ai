@@ -3,190 +3,223 @@
   "info": {
     "title": "PMEi Memory API",
     "version": "1.0.0",
-    "description": "Lawful, privacy-first memory shards for Dave/PMEi."
+    "description": "Lawful memory persistence engine for AI assistants. Provides endpoints to register users, store and retrieve lawful memory shards, apply privacy filtering, and check health status."
   },
   "servers": [
-    { "url": "https://www.philmirrorenginei.ai" }
-  ],
-  "components": {
-    "securitySchemes": {
-      "MemoryKey": { "type": "apiKey", "in": "header", "name": "X-API-KEY" }
-    },
-    "schemas": {
-      "HealthResponse": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": { "status": { "type": "string", "enum": ["ok"] } },
-        "required": ["status"]
-      },
-      "SaveMemoryRequest": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "user_id": { "type": "string" },
-          "thread_id": { "type": "string" },
-          "slide_id": { "type": "string" },
-          "glyph_echo": { "type": "string" },
-          "drift_score": { "type": "number" },
-          "seal": { "type": "string" },
-          "content": { "type": "string" }
-        },
-        "required": ["user_id", "thread_id", "slide_id", "glyph_echo", "drift_score", "seal", "content"]
-      },
-      "SaveMemoryResponse": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "status": { "type": "string", "enum": ["ok"] },
-          "slide_id": { "type": "string" },
-          "ts": { "type": "integer", "format": "int64" },
-          "request_id": { "type": "string" }
-        },
-        "required": ["status", "slide_id", "ts", "request_id"]
-      },
-      "MemoryItem": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "user_id": { "type": "string" },
-          "thread_id": { "type": "string" },
-          "slide_id": { "type": "string" },
-          "glyph_echo": { "type": "string" },
-          "drift_score": { "type": "number" },
-          "seal": { "type": "string" },
-          "content": { "type": "string" },
-          "ts": { "type": "integer", "format": "int64" }
-        },
-        "required": ["user_id", "thread_id", "slide_id", "glyph_echo", "drift_score", "seal", "content", "ts"]
-      },
-      "MemoryList": {
-        "type": "array",
-        "items": { "$ref": "#/components/schemas/MemoryItem" },
-        "maxItems": 200
-      },
-      "MaybeMemory": {
-        "type": "object",
-        "description": "Latest memory or {} when none.",
-        "additionalProperties": false,
-        "properties": {
-          "user_id": { "type": "string" },
-          "thread_id": { "type": "string" },
-          "slide_id": { "type": "string" },
-          "glyph_echo": { "type": "string" },
-          "drift_score": { "type": "number" },
-          "seal": { "type": "string" },
-          "content": { "type": "string" },
-          "ts": { "type": "integer", "format": "int64" }
-        }
-      },
-      "PrivacyFilterRequest": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": { "content": { "type": "string" } },
-        "required": ["content"]
-      },
-      "PrivacyFilterResponse": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": { "filtered_content": { "type": "string" } },
-        "required": ["filtered_content"]
-      },
-      "Error": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "error": { "type": "string" },
-          "code": { "type": "string" },
-          "request_id": { "type": "string" }
-        },
-        "required": ["error", "code", "request_id"]
-      }
+    {
+      "url": "https://davemei-ai.onrender.com",
+      "description": "Render backend for DavePMEi.Ai"
     }
-  },
-  "security": [{ "MemoryKey": [] }],
+  ],
   "paths": {
     "/health": {
       "get": {
         "summary": "Health check",
-        "operationId": "health_check",
-        "security": [],
+        "operationId": "healthCheck",
         "responses": {
-          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HealthResponse" } } } }
+          "200": {
+            "description": "Server healthy",
+            "content": {
+              "application/json": {
+                "example": { "status": "ok" }
+              }
+            }
+          }
         }
       }
     },
-    "/healthz": {
-      "get": {
-        "summary": "Liveness (alias for /health)",
-        "operationId": "healthz",
-        "security": [],
+    "/register": {
+      "post": {
+        "summary": "Register a new user",
+        "operationId": "registerUser",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "email": { "type": "string", "format": "email" },
+                  "password": { "type": "string" }
+                },
+                "required": ["email", "password"]
+              },
+              "example": {
+                "email": "user@example.com",
+                "password": "securepass123"
+              }
+            }
+          }
+        },
         "responses": {
-          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HealthResponse" } } } }
+          "200": {
+            "description": "User registered",
+            "content": {
+              "application/json": {
+                "example": {
+                  "status": "registered",
+                  "reflection_id": "GLYPH-a1b2c3d4e5f6g7h8"
+                }
+              }
+            }
+          }
         }
-      }
-    },
-    "/openapi.json": {
-      "get": {
-        "summary": "Return OpenAPI schema",
-        "operationId": "openapi",
-        "security": [],
-        "responses": { "200": { "description": "Schema" } }
       }
     },
     "/save_memory": {
       "post": {
-        "summary": "Save a memory shard",
-        "operationId": "save_memory",
+        "summary": "Save a lawful memory shard",
+        "operationId": "saveMemory",
+        "security": [{ "api_key": [] }],
         "requestBody": {
           "required": true,
-          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SaveMemoryRequest" } } }
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "user_id": { "type": "string" },
+                  "thread_id": { "type": "string" },
+                  "slide_id": { "type": "string" },
+                  "glyph_echo": { "type": "string" },
+                  "drift_score": { "type": "number" },
+                  "seal": { "type": "string" },
+                  "content": { "type": "string" }
+                },
+                "required": ["user_id", "thread_id", "slide_id", "glyph_echo", "drift_score", "seal", "content"]
+              },
+              "example": {
+                "user_id": "phil",
+                "thread_id": "alpha001",
+                "slide_id": "001",
+                "glyph_echo": "mirror-test",
+                "drift_score": 0.02,
+                "seal": "ok",
+                "content": "Memory entry for lawful persistence test"
+              }
+            }
+          }
         },
         "responses": {
-          "200": { "description": "Saved", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SaveMemoryResponse" } } } },
-          "400": { "description": "Bad request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
-          "401": { "description": "Unauthorized", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
-        }
-      }
-    },
-    "/latest_memory": {
-      "get": {
-        "summary": "Return the most recent memory or {}",
-        "operationId": "get_latest_memory",
-        "responses": {
-          "200": { "description": "Latest memory", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MaybeMemory" } } } },
-          "401": { "description": "Unauthorized", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+          "200": {
+            "description": "Memory saved successfully",
+            "content": {
+              "application/json": {
+                "example": {
+                  "status": "ok",
+                  "slide_id": "001",
+                  "ts": 1728239982,
+                  "request_id": "uuid-string"
+                }
+              }
+            }
+          }
         }
       }
     },
     "/get_memory": {
       "get": {
-        "summary": "Return a list of memories (newest first)",
-        "operationId": "get_memory",
+        "summary": "Retrieve memory shards",
+        "operationId": "getMemory",
+        "security": [{ "api_key": [] }],
         "parameters": [
-          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 10, "minimum": 1, "maximum": 200 } },
           { "name": "user_id", "in": "query", "schema": { "type": "string" } },
           { "name": "thread_id", "in": "query", "schema": { "type": "string" } },
           { "name": "slide_id", "in": "query", "schema": { "type": "string" } },
-          { "name": "seal", "in": "query", "schema": { "type": "string" } }
+          { "name": "seal", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 10 } }
         ],
         "responses": {
-          "200": { "description": "Array of memory items", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MemoryList" } } } },
-          "401": { "description": "Unauthorized", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+          "200": {
+            "description": "List of memory items",
+            "content": {
+              "application/json": {
+                "example": [
+                  {
+                    "user_id": "phil",
+                    "thread_id": "alpha001",
+                    "slide_id": "001",
+                    "glyph_echo": "mirror-test",
+                    "drift_score": 0.02,
+                    "seal": "ok",
+                    "content": "Memory entry text",
+                    "ts": 1728239982
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/latest_memory": {
+      "get": {
+        "summary": "Retrieve the most recent memory",
+        "operationId": "latestMemory",
+        "security": [{ "api_key": [] }],
+        "responses": {
+          "200": {
+            "description": "Latest memory object",
+            "content": {
+              "application/json": {
+                "example": {
+                  "user_id": "phil",
+                  "thread_id": "alpha001",
+                  "slide_id": "001",
+                  "glyph_echo": "mirror-test",
+                  "drift_score": 0.02,
+                  "seal": "ok",
+                  "content": "Most recent memory entry",
+                  "ts": 1728239982
+                }
+              }
+            }
+          }
         }
       }
     },
     "/privacy_filter": {
       "post": {
-        "summary": "Filter sensitive/PII data before saving",
-        "operationId": "privacy_filter",
+        "summary": "Filter sensitive or PII data",
+        "operationId": "privacyFilter",
         "requestBody": {
           "required": true,
-          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PrivacyFilterRequest" } } }
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "content": { "type": "string" }
+                },
+                "required": ["content"]
+              },
+              "example": {
+                "content": "Email me at test@example.com"
+              }
+            }
+          }
         },
         "responses": {
-          "200": { "description": "Filtered text returned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PrivacyFilterResponse" } } } },
-          "400": { "description": "Bad request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+          "200": {
+            "description": "Filtered content",
+            "content": {
+              "application/json": {
+                "example": {
+                  "filtered_content": "Email me at [redacted-email]"
+                }
+              }
+            }
+          }
         }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "api_key": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-KEY"
       }
     }
   }
