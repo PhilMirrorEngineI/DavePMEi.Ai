@@ -10,6 +10,8 @@ import json
 import time
 import uuid
 import sqlite3
+import hashlib
+import base64
 from flask import Flask, request, jsonify, g, Response
 
 # -----------------------------
@@ -17,18 +19,14 @@ from flask import Flask, request, jsonify, g, Response
 # -----------------------------
 MEMORY_API_KEY = os.environ.get("MEMORY_API_KEY", "").strip()
 
-# Prefer a persistent Render Disk mount. If you mounted at /data, set SQLITE_PATH=/data/dave.sqlite3
 DEFAULT_DB_PATH = "/data/dave.sqlite3" if os.path.isdir("/data") else (
     "/var/data/dave.sqlite3" if os.path.isdir("/var/data") else "./dave.sqlite3"
 )
 SQLITE_PATH = os.environ.get("SQLITE_PATH", DEFAULT_DB_PATH)
-
-# Path to your OpenAPI file in the repo
 OPENAPI_PATH = os.environ.get("OPENAPI_PATH", "./openapi.json")
 
 app = Flask(__name__)
 
-# Ensure DB directory exists
 _db_dir = os.path.dirname(os.path.abspath(SQLITE_PATH))
 if _db_dir and not os.path.exists(_db_dir):
     os.makedirs(_db_dir, exist_ok=True)
@@ -60,6 +58,17 @@ def init_db() -> None:
         );
         """
     )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email_hash TEXT UNIQUE NOT NULL,
+            reflection_id TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_ts INTEGER NOT NULL
+        );
+        """
+    )
     db.execute("CREATE INDEX IF NOT EXISTS idx_mem_ts     ON memories(ts DESC);")
     db.execute("CREATE INDEX IF NOT EXISTS idx_mem_thread ON memories(thread_id);")
     db.execute("CREATE INDEX IF NOT EXISTS idx_mem_user   ON memories(user_id);")
@@ -83,10 +92,8 @@ def unauthorized():
 
 @app.before_request
 def auth_gate():
-    # Public routes
     if request.path in ("/health", "/healthz", "/openapi.json"):
         return
-    # All other routes require X-API-KEY header (query fallback allowed for convenience)
     supplied = request.headers.get("X-API-KEY") or request.args.get("api_key")
     if not MEMORY_API_KEY or supplied != MEMORY_API_KEY:
         return unauthorized()
@@ -112,7 +119,6 @@ def validate_payload(required_fields, data):
         return False, f"Missing required fields: {', '.join(missing)}"
     return True, ""
 
-# very simple PII masking
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 PHONE_RE = re.compile(r"\+?\d[\d\s().-]{7,}\d")
 
@@ -120,6 +126,13 @@ def privacy_mask(text: str) -> str:
     text = EMAIL_RE.sub("[redacted-email]", text)
     text = PHONE_RE.sub("[redacted-phone]", text)
     return text
+
+def generate_reflection_id(email: str) -> str:
+    if not email:
+        raise ValueError("Email required")
+    hashed_bytes = hashlib.sha256(email.lower().encode("utf-8")).digest()
+    reflection_id = base64.urlsafe_b64encode(hashed_bytes).decode("utf-8").rstrip("=")
+    return f"GLYPH-{reflection_id[:16]}"
 
 # -----------------------------
 # Routes
@@ -138,9 +151,42 @@ def openapi_file():
     except Exception as e:
         return jsonify({"error": f"openapi.json not found or unreadable: {e}"}), 500
 
+@app.route("/register", methods=["POST"])
+def register_user():
+    data = request.get_json(silent=True) or {}
+    email = data.get("email")
+    password = data.get("password")
+
+    if not email or not password:
+        return jsonify({"error": "Missing email or password"}), 400
+
+    reflection_id = generate_reflection_id(email)
+    email_hash = hashlib.sha256(email.lower().encode()).hexdigest()
+    password_hash = hashlib.sha256(password.encode()).hexdigest()
+    ts = int(time.time())
+
+    db = get_db()
+    db.execute(
+        """
+        INSERT OR REPLACE INTO users (email_hash, reflection_id, password_hash, created_ts)
+        VALUES (?, ?, ?, ?);
+        """,
+        (email_hash, reflection_id, password_hash, ts)
+    )
+    db.commit()
+
+    return jsonify({
+        "status": "registered",
+        "reflection_id": reflection_id
+    })
+
 @app.route("/save_memory", methods=["POST"])
 def save_memory():
     data = request.get_json(silent=True) or {}
+
+    if "email" in data and "user_id" not in data:
+        data["user_id"] = generate_reflection_id(data["email"])
+
     ok, err = validate_payload(
         ["user_id", "thread_id", "slide_id", "glyph_echo", "drift_score", "seal", "content"],
         data
@@ -186,12 +232,11 @@ def latest_memory():
         """
     ).fetchone()
     if not row:
-        return jsonify({})  # empty object when none
+        return jsonify({})
     return jsonify(row_to_memory_item(row))
 
 @app.route("/get_memory", methods=["GET"])
 def get_memory():
-    # limit with bounds + robust parsing
     try:
         limit = int(request.args.get("limit", 10))
     except ValueError:
@@ -216,7 +261,7 @@ def get_memory():
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     sql = (
         "SELECT user_id, thread_id, slide_id, glyph_echo, drift_score, seal, content, ts "
-        f"FROM memories {where_sql} ORDER BY ts DESC LIMIT ?;"
+                f"FROM memories {where_sql} ORDER BY ts DESC LIMIT ?;"
     )
     params.append(limit)
 
@@ -224,17 +269,8 @@ def get_memory():
     rows = db.execute(sql, params).fetchall()
     items = [row_to_memory_item(r) for r in rows]
     return jsonify(items)
-
-@app.route("/privacy_filter", methods=["POST"])
-def privacy_filter():
-    data = request.get_json(silent=True) or {}
-    ok, err = validate_payload(["content"], data)
-    if not ok:
-        return jsonify({"error": err, "code": "bad_request", "request_id": str(uuid.uuid4())}), 400
-    return jsonify({"filtered_content": privacy_mask(str(data["content"]))})
-
 # -----------------------------
-# App startup (Flask 3–compatible)
+# App startup
 # -----------------------------
 with app.app_context():
     init_db()
