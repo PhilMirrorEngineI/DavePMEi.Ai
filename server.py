@@ -1,48 +1,115 @@
-# Flask JSON + CORS + Auth Handshake (render-safe + sqlite fallback)
+# DavePMEi Memory API — Hybrid Neon(Postgres) + SQLite Fallback
+# - POST /save_memory   (auth required)
+# - GET  /get_memory    (auth required)
+# - GET  /health, /     (no auth)
+#
+# Behavior:
+#   If DATABASE_URL starts with postgres:// or postgresql:// -> use Neon (psycopg2, pooled)
+#   else -> SQLite at DB_PATH (default /var/data/dave.sqlite3, fallback to /tmp/dave.sqlite3)
+#
+# CORS: ALLOWED_ORIGIN="https://your-vercel.app,https://your-runner.com" (or "*")
+# Auth: MEMORY_API_KEY via X-API-Key / X-API-KEY / Authorization: Bearer
+
 from flask import Flask, request, jsonify
 from functools import wraps
 from pathlib import Path
-import sqlite3, os, time, uuid, stat
+import os, time, uuid, sqlite3, contextlib
 
 app = Flask(__name__)
 
-MEMORY_API_KEY = os.environ.get("MEMORY_API_KEY", "").strip()
-ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*").strip()  # CSV or "*"
-CONFIG_DB_PATH = os.environ.get("DB_PATH", "/var/data/dave.sqlite3").strip()
-MAX_CONTENT_CHARS = int(os.environ.get("MAX_CONTENT_CHARS", "65536"))  # 64KB
+# ----------------------- Env -----------------------
+MEMORY_API_KEY      = os.environ.get("MEMORY_API_KEY", "").strip()
+ALLOWED_ORIGIN      = os.environ.get("ALLOWED_ORIGIN", "*").strip()   # CSV or "*"
+DATABASE_URL        = os.environ.get("DATABASE_URL", "").strip()      # Neon URL
+CONFIG_DB_PATH      = os.environ.get("DB_PATH", "/var/data/dave.sqlite3").strip()
+MAX_CONTENT_CHARS   = int(os.environ.get("MAX_CONTENT_CHARS", "65536"))
+PG_MINCONN          = int(os.environ.get("PG_MINCONN", "1"))
+PG_MAXCONN          = int(os.environ.get("PG_MAXCONN", "5"))
 
-# ---------- storage path selection ----------
-def _dir_writable(p: Path) -> bool:
-    try:
-        p.mkdir(parents=True, exist_ok=True)
-        testf = p / ".writetest"
-        with testf.open("w") as f:
-            f.write("ok")
-        testf.unlink()
-        return True
-    except Exception:
-        return False
+# -------------------- DB Abstraction ----------------
+class DB:
+    kind = "sqlite"      # "postgres" or "sqlite"
+    placeholder = "?"    # "%s" for pg, "?" for sqlite
 
-def _pick_db_path():
-    # prefer configured path; fall back to /tmp on permission error
-    cfg = Path(CONFIG_DB_PATH)
-    if _dir_writable(cfg.parent):
-        return str(cfg)
-    tmp = Path("/tmp/dave.sqlite3")
-    tmp.parent.mkdir(parents=True, exist_ok=True)
-    return str(tmp)
+    # --- Postgres (Neon) ---
+    @classmethod
+    def try_postgres(cls):
+        if not (DATABASE_URL.lower().startswith("postgres://") or DATABASE_URL.lower().startswith("postgresql://")):
+            return False
+        try:
+            import psycopg2
+            import psycopg2.pool
+            import psycopg2.extras
+        except Exception:
+            return False
+        try:
+            cls.pg_extras = psycopg2.extras
+            cls.pool = psycopg2.pool.SimpleConnectionPool(
+                PG_MINCONN, PG_MAXCONN, dsn=DATABASE_URL, keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5
+            )
+            # smoke test + init
+            with cls.get_pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS memories(
+                          id BIGSERIAL PRIMARY KEY,
+                          user_id TEXT NOT NULL,
+                          thread_id TEXT NOT NULL,
+                          slide_id TEXT NOT NULL,
+                          glyph_echo TEXT NOT NULL,
+                          drift_score DOUBLE PRECISION NOT NULL,
+                          seal TEXT NOT NULL,
+                          role TEXT NOT NULL,
+                          content TEXT NOT NULL,
+                          ts BIGINT NOT NULL
+                        );
+                    """)
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_ts     ON memories(ts DESC);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_user   ON memories(user_id);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_thread ON memories(thread_id);")
+                conn.commit()
+            cls.kind = "postgres"
+            cls.placeholder = "%s"
+            return True
+        except Exception:
+            # If pg init fails for any reason, fall back to sqlite
+            return False
 
-DB_PATH = _pick_db_path()
+    @classmethod
+    @contextlib.contextmanager
+    def get_pg_conn(cls):
+        conn = cls.pool.getconn()
+        try:
+            yield conn
+        finally:
+            cls.pool.putconn(conn)
 
-# ---------- db ----------
-def _db():
-    if not hasattr(app, "_db"):
-        app._db = sqlite3.connect(DB_PATH, check_same_thread=False)
-        app._db.row_factory = sqlite3.Row
-        # sane defaults for concurrency
-        app._db.execute("PRAGMA journal_mode=WAL;")
-        app._db.execute("PRAGMA busy_timeout=5000;")
-        app._db.execute("""
+    # --- SQLite ---
+    @staticmethod
+    def _dir_writable(p: Path) -> bool:
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            testf = p / ".writetest"
+            with testf.open("w") as f:
+                f.write("ok")
+            testf.unlink()
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def init_sqlite(cls):
+        # prefer configured path, else /tmp
+        cfg = Path(CONFIG_DB_PATH)
+        if not cls._dir_writable(cfg.parent):
+            cfg = Path("/tmp/dave.sqlite3")
+            cfg.parent.mkdir(parents=True, exist_ok=True)
+        cls.sqlite_path = str(cfg)
+        cls.sqlite = sqlite3.connect(cls.sqlite_path, check_same_thread=False)
+        cls.sqlite.row_factory = sqlite3.Row
+        cls.sqlite.execute("PRAGMA journal_mode=WAL;")
+        cls.sqlite.execute("PRAGMA busy_timeout=5000;")
+        cls.sqlite.execute("""
             CREATE TABLE IF NOT EXISTS memories(
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               user_id TEXT NOT NULL,
@@ -56,30 +123,92 @@ def _db():
               ts INTEGER NOT NULL
             );
         """)
-        app._db.execute("CREATE INDEX IF NOT EXISTS idx_mem_ts     ON memories(ts);")
-        app._db.execute("CREATE INDEX IF NOT EXISTS idx_mem_user   ON memories(user_id);")
-        app._db.execute("CREATE INDEX IF NOT EXISTS idx_mem_thread ON memories(thread_id);")
-        app._db.commit()
-    return app._db
+        cls.sqlite.execute("CREATE INDEX IF NOT EXISTS idx_mem_ts     ON memories(ts DESC);")
+        cls.sqlite.execute("CREATE INDEX IF NOT EXISTS idx_mem_user   ON memories(user_id);")
+        cls.sqlite.execute("CREATE INDEX IF NOT EXISTS idx_mem_thread ON memories(thread_id);")
+        cls.sqlite.commit()
+        cls.kind = "sqlite"
+        cls.placeholder = "?"
 
-# ---------- errors ----------
+    # --- Public helpers ---
+    @classmethod
+    def init(cls):
+        if cls.try_postgres():
+            return
+        cls.init_sqlite()
+
+    @classmethod
+    def insert_memory(cls, rec):
+        if cls.kind == "postgres":
+            with cls.get_pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(f"""
+                        INSERT INTO memories(user_id,thread_id,slide_id,glyph_echo,drift_score,seal,role,content,ts)
+                        VALUES({cls.placeholder},{cls.placeholder},{cls.placeholder},{cls.placeholder},{cls.placeholder},
+                               {cls.placeholder},{cls.placeholder},{cls.placeholder},{cls.placeholder})
+                        RETURNING slide_id;
+                    """, (rec["user_id"], rec["thread_id"], rec["slide_id"], rec["glyph_echo"], rec["drift_score"],
+                          rec["seal"], rec["role"], rec["content"], rec["ts"]))
+                conn.commit()
+            return rec["slide_id"]
+        else:
+            cls.sqlite.execute("""
+                INSERT INTO memories(user_id,thread_id,slide_id,glyph_echo,drift_score,seal,role,content,ts)
+                VALUES(?,?,?,?,?,?,?,?,?)
+            """, (rec["user_id"], rec["thread_id"], rec["slide_id"], rec["glyph_echo"], rec["drift_score"],
+                  rec["seal"], rec["role"], rec["content"], rec["ts"]))
+            cls.sqlite.commit()
+            return rec["slide_id"]
+
+    @classmethod
+    def select_memories(cls, filters, limit:int):
+        clauses, params = [], []
+        for key in ("user_id","thread_id","slide_id","seal","role"):
+            val = filters.get(key)
+            if val:
+                clauses.append(f"{key} = {cls.placeholder}")
+                params.append(val)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        if cls.kind == "postgres":
+            with cls.get_pg_conn() as conn:
+                with conn.cursor(cursor_factory=cls.pg_extras.RealDictCursor) as cur:
+                    cur.execute(f"""
+                        SELECT user_id,thread_id,slide_id,glyph_echo,drift_score,seal,role,content,ts
+                        FROM memories
+                        {where_sql}
+                        ORDER BY ts DESC
+                        LIMIT {cls.placeholder};
+                    """, params + [limit])
+                    rows = cur.fetchall()
+            return [dict(r) for r in rows]
+        else:
+            rows = cls.sqlite.execute(f"""
+                SELECT user_id,thread_id,slide_id,glyph_echo,drift_score,seal,role,content,ts
+                FROM memories
+                {where_sql}
+                ORDER BY ts DESC
+                LIMIT ?
+            """, params + [limit]).fetchall()
+            return [dict(r) for r in rows]
+
+DB.init()
+
+# -------------------- Errors -> JSON ----------------
 @app.errorhandler(Exception)
-def handle_error(e):
+def on_error(e):
     code = getattr(e, "code", 500)
     return jsonify({"ok": False, "error": str(e), "code": code}), code
 
-# ---------- auth ----------
+# -------------------- Auth -------------------------
 def _auth_ok():
     if not MEMORY_API_KEY:
         return False
-    headers = request.headers
-    k1 = headers.get("X-API-Key", "")
-    k2 = headers.get("X-API-KEY", "")
-    auth = headers.get("Authorization", "")
-    bear = ""
-    if auth.lower().startswith("bearer "):
-        bear = auth.split(" ", 1)[1].strip()
-    return any(k == MEMORY_API_KEY for k in (k1, k2, bear))
+    h = request.headers
+    k1 = h.get("X-API-Key", "")
+    k2 = h.get("X-API-KEY", "")
+    auth = h.get("Authorization", "")
+    bearer = auth.split(" ", 1)[1].strip() if auth.lower().startswith("bearer ") and " " in auth else ""
+    return any(x == MEMORY_API_KEY for x in (k1, k2, bearer))
 
 def require_key(fn):
     @wraps(fn)
@@ -91,7 +220,7 @@ def require_key(fn):
         return fn(*args, **kwargs)
     return wrapped
 
-# ---------- CORS ----------
+# -------------------- CORS -------------------------
 def _origin_allowed(origin: str) -> bool:
     if not origin:
         return False
@@ -104,7 +233,7 @@ def _origin_allowed(origin: str) -> bool:
 def add_cors(resp):
     origin = request.headers.get("Origin", "")
     if ALLOWED_ORIGIN == "*" or _origin_allowed(origin):
-        resp.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
+        resp.headers["Access-Control-Allow-Origin"] = origin or "*"
         resp.headers["Vary"] = "Origin"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, X-API-KEY, Authorization"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
@@ -119,20 +248,25 @@ def add_cors(resp):
 def options_any():
     return ("", 204)
 
-# ---------- routes ----------
+# -------------------- Routes -----------------------
 @app.route("/")
 def root():
-    return jsonify({
+    info = {
         "ok": True,
-        "service": "DavePMEi Memory API (sqlite)",
-        "db_path": DB_PATH,
+        "service": "DavePMEi Memory API (hybrid)",
+        "storage": DB.kind,
         "endpoints": ["/health","/save_memory","/get_memory"]
-    })
+    }
+    if DB.kind == "sqlite":
+        info["sqlite_path"] = getattr(DB, "sqlite_path", "?")
+    return jsonify(info)
 
 @app.route("/health")
 def health():
-    storage = "sqlite:/tmp" if DB_PATH.startswith("/tmp/") else "sqlite:custom"
-    return jsonify({"ok": True, "ts": int(time.time()), "storage": storage, "db_path": DB_PATH})
+    detail = {"ok": True, "ts": int(time.time()), "storage": DB.kind}
+    if DB.kind == "sqlite":
+        detail["sqlite_path"] = getattr(DB, "sqlite_path", "?")
+    return jsonify(detail)
 
 @app.route("/save_memory", methods=["POST","OPTIONS"])
 @require_key
@@ -144,27 +278,24 @@ def save_memory():
     user_id = str(data.get("user_id", "")).strip()
     content = str(data.get("content", "")).strip()
     role     = (str(data.get("role", "assistant")).strip() or "assistant")[:32]
-
     if not user_id or not content:
         return jsonify({"ok": False, "error": "Missing user_id or content"}), 400
     if len(content) > MAX_CONTENT_CHARS:
         return jsonify({"ok": False, "error": f"content too large (> {MAX_CONTENT_CHARS} chars)"}), 413
 
-    thread_id   = (str(data.get("thread_id", "general")).strip() or "general")[:64]
-    slide_id    = str(data.get("slide_id", str(uuid.uuid4()))).strip()
-    glyph_echo  = (str(data.get("glyph_echo", "🪞")).strip() or "🪞")[:16]
-    drift_score = float(data.get("drift_score", 0.05))
-    seal        = (str(data.get("seal", "lawful")).strip() or "lawful")[:32]
-
-    ts = int(time.time())
-    db = _db()
-    db.execute(
-        """INSERT INTO memories(user_id,thread_id,slide_id,glyph_echo,drift_score,seal,role,content,ts)
-           VALUES(?,?,?,?,?,?,?,?,?)""",
-        (user_id,thread_id,slide_id,glyph_echo,drift_score,seal,role,content,ts)
-    )
-    db.commit()
-    return jsonify({"ok": True, "status": "ok", "slide_id": slide_id, "ts": ts}), 201
+    rec = {
+        "user_id":   user_id,
+        "thread_id": (str(data.get("thread_id", "general")).strip() or "general")[:64],
+        "slide_id":  str(data.get("slide_id", str(uuid.uuid4()))).strip(),
+        "glyph_echo":(str(data.get("glyph_echo", "🪞")).strip() or "🪞")[:16],
+        "drift_score": float(data.get("drift_score", 0.05)),
+        "seal":      (str(data.get("seal", "lawful")).strip() or "lawful")[:32],
+        "role":      role,
+        "content":   content,
+        "ts":        int(time.time())
+    }
+    slide_id = DB.insert_memory(rec)
+    return jsonify({"ok": True, "status": "ok", "slide_id": slide_id, "ts": rec["ts"]}), 201
 
 @app.route("/get_memory", methods=["GET","OPTIONS"])
 @require_key
@@ -172,32 +303,22 @@ def get_memory():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    user_id   = request.args.get("user_id")
-    thread_id = request.args.get("thread_id")
-    slide_id  = request.args.get("slide_id")
-    seal      = request.args.get("seal")
-    role      = request.args.get("role")
+    args = request.args
+    filters = {
+        "user_id":   args.get("user_id"),
+        "thread_id": args.get("thread_id"),
+        "slide_id":  args.get("slide_id"),
+        "seal":      args.get("seal"),
+        "role":      args.get("role"),
+    }
     try:
-        limit = max(1, min(int(request.args.get("limit","10")), 200))
+        limit = max(1, min(int(args.get("limit","50")), 200))
     except ValueError:
         return jsonify({"ok": False, "error": "limit must be an integer"}), 400
 
-    clauses, params = [], []
-    if user_id:   clauses.append("user_id = ?");   params.append(user_id)
-    if thread_id: clauses.append("thread_id = ?"); params.append(thread_id)
-    if slide_id:  clauses.append("slide_id = ?");  params.append(slide_id)
-    if seal:      clauses.append("seal = ?");      params.append(seal)
-    if role:      clauses.append("role = ?");      params.append(role)
-
-    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    rows = _db().execute(
-        f"""SELECT user_id,thread_id,slide_id,glyph_echo,drift_score,seal,role,content,ts
-            FROM memories {where_sql}
-            ORDER BY ts DESC LIMIT ?""",
-        params + [limit]
-    ).fetchall()
-    items = [dict(r) for r in rows]
+    items = DB.select_memories(filters, limit)
     return jsonify({"ok": True, "items": items, "count": len(items)}), 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
