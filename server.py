@@ -1,30 +1,72 @@
 # DavePMEi Memory API — Hybrid Neon(Postgres) + SQLite Fallback
-# - POST /save_memory   (auth required)
-# - GET  /get_memory    (auth required)
-# - GET  /health, /     (no auth)
+# Endpoints
+#   GET  /health
+#   GET  /
+#   POST /save_memory     (auth)
+#   GET  /get_memory      (auth)  -> supports limit & before_ts cursor
 #
-# Behavior:
-#   If DATABASE_URL starts with postgres:// or postgresql:// -> use Neon (psycopg2, pooled)
-#   else -> SQLite at DB_PATH (default /var/data/dave.sqlite3, fallback to /tmp/dave.sqlite3)
+# Env
+#   MEMORY_API_KEY   : required for auth
+#   ALLOWED_ORIGIN   : CSV of origins or "*"
+#   DATABASE_URL     : postgres://... (Neon)  -> else SQLite fallback
+#   DB_PATH          : sqlite file (default /var/data/dave.sqlite3)
+#   MAX_CONTENT_CHARS: default 65536
+#   PG_MINCONN/PG_MAXCONN: pool sizing
 #
-# CORS: ALLOWED_ORIGIN="https://your-vercel.app,https://your-runner.com" (or "*")
-# Auth: MEMORY_API_KEY via X-API-Key / X-API-KEY / Authorization: Bearer
+# PMEi Guards
+#   - drift_score is clamped to <= 0.30
+#   - seal must be one of {ok, important, critical, lawful}
+#   - glyph_echo trimmed to <= 16 chars
+#   - auto slide_id t-001, t-002... per (user_id, thread_id) if not provided
 
 from flask import Flask, request, jsonify
 from functools import wraps
 from pathlib import Path
-import os, time, uuid, sqlite3, contextlib
+from collections import defaultdict
+import os, time, uuid, sqlite3, contextlib, re
 
 app = Flask(__name__)
 
 # ----------------------- Env -----------------------
 MEMORY_API_KEY      = os.environ.get("MEMORY_API_KEY", "").strip()
-ALLOWED_ORIGIN      = os.environ.get("ALLOWED_ORIGIN", "*").strip()   # CSV or "*"
-DATABASE_URL        = os.environ.get("DATABASE_URL", "").strip()      # Neon URL
+ALLOWED_ORIGIN      = os.environ.get("ALLOWED_ORIGIN", "*").strip()
+DATABASE_URL        = os.environ.get("DATABASE_URL", "").strip()
 CONFIG_DB_PATH      = os.environ.get("DB_PATH", "/var/data/dave.sqlite3").strip()
 MAX_CONTENT_CHARS   = int(os.environ.get("MAX_CONTENT_CHARS", "65536"))
 PG_MINCONN          = int(os.environ.get("PG_MINCONN", "1"))
 PG_MAXCONN          = int(os.environ.get("PG_MAXCONN", "5"))
+
+# -------------------- PMEi constraints -------------
+SAFE_SEALS = {"ok", "important", "critical", "lawful"}
+GLYPH_MAX = 16
+SLIDE_RE  = re.compile(r"^t-\d{3,6}$")  # t-001..t-999999
+RATE_BUCKET = defaultdict(list)          # naive per-minute limiter
+
+def clamp_drift(x) -> float:
+    try:
+        v = float(x)
+    except Exception:
+        return 0.10
+    return max(0.0, min(v, 0.30))
+
+def sanitize_glyph(g: str) -> str:
+    g = (g or "🪞").strip()
+    return g[:GLYPH_MAX]
+
+def sanitize_seal(s: str) -> str:
+    s = (s or "lawful").strip().lower()
+    return s if s in SAFE_SEALS else "lawful"
+
+def rate_limit_ok(key: str, max_per_min=120):
+    now = time.time()
+    bucket = RATE_BUCKET[key]
+    # prune stale entries (>60s)
+    while bucket and now - bucket[0] > 60:
+        bucket.pop(0)
+    if len(bucket) >= max_per_min:
+        return False
+    bucket.append(now)
+    return True
 
 # -------------------- DB Abstraction ----------------
 class DB:
@@ -45,9 +87,9 @@ class DB:
         try:
             cls.pg_extras = psycopg2.extras
             cls.pool = psycopg2.pool.SimpleConnectionPool(
-                PG_MINCONN, PG_MAXCONN, dsn=DATABASE_URL, keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5
+                PG_MINCONN, PG_MAXCONN, dsn=DATABASE_URL,
+                keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5
             )
-            # smoke test + init
             with cls.get_pg_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
@@ -64,15 +106,16 @@ class DB:
                           ts BIGINT NOT NULL
                         );
                     """)
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_ts     ON memories(ts DESC);")
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_user   ON memories(user_id);")
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_thread ON memories(thread_id);")
+                    # Useful indexes
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_ts       ON memories(ts DESC);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_user     ON memories(user_id);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_thread   ON memories(thread_id);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_user_thr ON memories(user_id, thread_id, ts DESC);")
                 conn.commit()
             cls.kind = "postgres"
             cls.placeholder = "%s"
             return True
         except Exception:
-            # If pg init fails for any reason, fall back to sqlite
             return False
 
     @classmethod
@@ -99,7 +142,6 @@ class DB:
 
     @classmethod
     def init_sqlite(cls):
-        # prefer configured path, else /tmp
         cfg = Path(CONFIG_DB_PATH)
         if not cls._dir_writable(cfg.parent):
             cfg = Path("/tmp/dave.sqlite3")
@@ -123,9 +165,10 @@ class DB:
               ts INTEGER NOT NULL
             );
         """)
-        cls.sqlite.execute("CREATE INDEX IF NOT EXISTS idx_mem_ts     ON memories(ts DESC);")
-        cls.sqlite.execute("CREATE INDEX IF NOT EXISTS idx_mem_user   ON memories(user_id);")
-        cls.sqlite.execute("CREATE INDEX IF NOT EXISTS idx_mem_thread ON memories(thread_id);")
+        cls.sqlite.execute("CREATE INDEX IF NOT EXISTS idx_mem_ts       ON memories(ts DESC);")
+        cls.sqlite.execute("CREATE INDEX IF NOT EXISTS idx_mem_user     ON memories(user_id);")
+        cls.sqlite.execute("CREATE INDEX IF NOT EXISTS idx_mem_thread   ON memories(thread_id);")
+        cls.sqlite.execute("CREATE INDEX IF NOT EXISTS idx_mem_user_thr ON memories(user_id, thread_id, ts DESC);")
         cls.sqlite.commit()
         cls.kind = "sqlite"
         cls.placeholder = "?"
@@ -161,13 +204,41 @@ class DB:
             return rec["slide_id"]
 
     @classmethod
-    def select_memories(cls, filters, limit:int):
+    def select_latest_in_thread(cls, user_id: str, thread_id: str):
+        # returns most recent shard in a (user, thread) or None
+        if cls.kind == "postgres":
+            with cls.get_pg_conn() as conn:
+                with conn.cursor(cursor_factory=cls.pg_extras.RealDictCursor) as cur:
+                    cur.execute(f"""
+                        SELECT slide_id, ts
+                        FROM memories
+                        WHERE user_id={cls.placeholder} AND thread_id={cls.placeholder}
+                        ORDER BY ts DESC
+                        LIMIT 1;
+                    """, (user_id, thread_id))
+                    row = cur.fetchone()
+            return dict(row) if row else None
+        else:
+            row = cls.sqlite.execute("""
+                SELECT slide_id, ts
+                FROM memories
+                WHERE user_id=? AND thread_id=?
+                ORDER BY ts DESC
+                LIMIT 1
+            """, (user_id, thread_id)).fetchone()
+            return dict(row) if row else None
+
+    @classmethod
+    def select_memories(cls, filters, limit:int, before_ts:int|None=None):
         clauses, params = [], []
         for key in ("user_id","thread_id","slide_id","seal","role"):
             val = filters.get(key)
             if val:
                 clauses.append(f"{key} = {cls.placeholder}")
                 params.append(val)
+        if before_ts:
+            clauses.append(f"ts < {cls.placeholder}")
+            params.append(before_ts)
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         if cls.kind == "postgres":
             with cls.get_pg_conn() as conn:
@@ -220,7 +291,7 @@ def require_key(fn):
         return fn(*args, **kwargs)
     return wrapped
 
-# -------------------- CORS -------------------------
+# -------------------- CORS + Security --------------
 def _origin_allowed(origin: str) -> bool:
     if not origin:
         return False
@@ -230,23 +301,44 @@ def _origin_allowed(origin: str) -> bool:
     return origin in allowed
 
 @app.after_request
-def add_cors(resp):
+def add_headers(resp):
     origin = request.headers.get("Origin", "")
     if ALLOWED_ORIGIN == "*" or _origin_allowed(origin):
         resp.headers["Access-Control-Allow-Origin"] = origin or "*"
         resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, X-API-KEY, Authorization"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    resp.headers["Access-Control-Max-Age"] = "600"
     resp.headers["Content-Type"] = "application/json; charset=utf-8"
     if request.path == "/get_memory":
         resp.headers["Cache-Control"] = "no-store"
         resp.headers["Pragma"] = "no-cache"
+    # soft security headers
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["X-Frame-Options"] = "DENY"
     return resp
 
 @app.route("/options", methods=["OPTIONS"])
 def options_any():
     return ("", 204)
+
+# -------------------- Helpers ----------------------
+def next_slide_id_for(user_id: str, thread_id: str) -> str:
+    last = DB.select_latest_in_thread(user_id, thread_id)
+    if last and SLIDE_RE.match(last.get("slide_id", "")):
+        n = int(last["slide_id"].split("-")[1])
+        return f"t-{n+1:03d}"
+    return "t-001"
+
+def client_ip():
+    return (
+        request.headers.get("CF-Connecting-IP")
+        or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        or request.remote_addr
+        or "ip"
+    )
 
 # -------------------- Routes -----------------------
 @app.route("/")
@@ -274,34 +366,54 @@ def save_memory():
     if request.method == "OPTIONS":
         return ("", 204)
 
+    # simple per-IP rate limit
+    if not rate_limit_ok(f"save:{client_ip()}", max_per_min=120):
+        return jsonify({"ok": False, "error": "Rate limit"}), 429
+
     data = request.get_json(silent=True) or {}
-    user_id = str(data.get("user_id", "")).strip()
-    content = str(data.get("content", "")).strip()
-    role     = (str(data.get("role", "assistant")).strip() or "assistant")[:32]
+    user_id   = str(data.get("user_id", "")).strip()
+    thread_id = (str(data.get("thread_id", "general")).strip() or "general")[:64]
+    content   = str(data.get("content", "")).strip()
+    role      = (str(data.get("role", "assistant")).strip() or "assistant")[:32]
+
     if not user_id or not content:
         return jsonify({"ok": False, "error": "Missing user_id or content"}), 400
     if len(content) > MAX_CONTENT_CHARS:
         return jsonify({"ok": False, "error": f"content too large (> {MAX_CONTENT_CHARS} chars)"}), 413
 
+    drift_score = clamp_drift(data.get("drift_score", 0.10))
+    glyph_echo  = sanitize_glyph(data.get("glyph_echo", "🪞"))
+    seal        = sanitize_seal(data.get("seal", "lawful"))
+
+    slide_id = str(data.get("slide_id", "")).strip()
+    if not slide_id:
+        slide_id = next_slide_id_for(user_id, thread_id)
+    elif not SLIDE_RE.match(slide_id):
+        # If client supplied something non-conforming, normalize to next auto
+        slide_id = next_slide_id_for(user_id, thread_id)
+
     rec = {
         "user_id":   user_id,
-        "thread_id": (str(data.get("thread_id", "general")).strip() or "general")[:64],
-        "slide_id":  str(data.get("slide_id", str(uuid.uuid4()))).strip(),
-        "glyph_echo":(str(data.get("glyph_echo", "🪞")).strip() or "🪞")[:16],
-        "drift_score": float(data.get("drift_score", 0.05)),
-        "seal":      (str(data.get("seal", "lawful")).strip() or "lawful")[:32],
+        "thread_id": thread_id,
+        "slide_id":  slide_id,
+        "glyph_echo":glyph_echo,
+        "drift_score": drift_score,
+        "seal":      seal,
         "role":      role,
         "content":   content,
         "ts":        int(time.time())
     }
-    slide_id = DB.insert_memory(rec)
-    return jsonify({"ok": True, "status": "ok", "slide_id": slide_id, "ts": rec["ts"]}), 201
+    out_id = DB.insert_memory(rec)
+    return jsonify({"ok": True, "status": "ok", "slide_id": out_id, "ts": rec["ts"]}), 201
 
 @app.route("/get_memory", methods=["GET","OPTIONS"])
 @require_key
 def get_memory():
     if request.method == "OPTIONS":
         return ("", 204)
+
+    if not rate_limit_ok(f"get:{client_ip()}", max_per_min=240):
+        return jsonify({"ok": False, "error": "Rate limit"}), 429
 
     args = request.args
     filters = {
@@ -316,9 +428,18 @@ def get_memory():
     except ValueError:
         return jsonify({"ok": False, "error": "limit must be an integer"}), 400
 
-    items = DB.select_memories(filters, limit)
-    return jsonify({"ok": True, "items": items, "count": len(items)}), 200
+    before_ts = None
+    if "before_ts" in args and args.get("before_ts"):
+        try:
+            before_ts = int(args.get("before_ts"))
+        except ValueError:
+            return jsonify({"ok": False, "error": "before_ts must be an integer epoch seconds"}), 400
 
+    items = DB.select_memories(filters, limit, before_ts=before_ts)
+    next_cursor = items[-1]["ts"] if items else None
+    return jsonify({"ok": True, "items": items, "count": len(items), "next_before_ts": next_cursor}), 200
+
+# -------------------- Run --------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
