@@ -8,10 +8,11 @@
 # Env
 #   MEMORY_API_KEY   : required for auth
 #   ALLOWED_ORIGIN   : CSV of origins or "*"
-#   DATABASE_URL     : postgres://... (Neon)  -> else SQLite fallback
+#   DATABASE_URL     : postgresql://... (Neon)  -> else SQLite fallback
 #   DB_PATH          : sqlite file (default /var/data/dave.sqlite3)
 #   MAX_CONTENT_CHARS: default 65536
 #   PG_MINCONN/PG_MAXCONN: pool sizing
+#   DEBUG_BOOT       : "1" to log boot decisions (no secrets)
 #
 # PMEi Guards
 #   - drift_score is clamped to <= 0.30
@@ -35,6 +36,7 @@ CONFIG_DB_PATH      = os.environ.get("DB_PATH", "/var/data/dave.sqlite3").strip(
 MAX_CONTENT_CHARS   = int(os.environ.get("MAX_CONTENT_CHARS", "65536"))
 PG_MINCONN          = int(os.environ.get("PG_MINCONN", "1"))
 PG_MAXCONN          = int(os.environ.get("PG_MAXCONN", "5"))
+DEBUG_BOOT          = os.environ.get("DEBUG_BOOT", "0") == "1"
 
 # -------------------- PMEi constraints -------------
 SAFE_SEALS = {"ok", "important", "critical", "lawful"}
@@ -60,7 +62,6 @@ def sanitize_seal(s: str) -> str:
 def rate_limit_ok(key: str, max_per_min=120):
     now = time.time()
     bucket = RATE_BUCKET[key]
-    # prune stale entries (>60s)
     while bucket and now - bucket[0] > 60:
         bucket.pop(0)
     if len(bucket) >= max_per_min:
@@ -73,18 +74,38 @@ class DB:
     kind = "sqlite"      # "postgres" or "sqlite"
     placeholder = "?"    # "%s" for pg, "?" for sqlite
 
-    # --- Postgres (Neon) ---
     @classmethod
     def try_postgres(cls):
-        if not (DATABASE_URL.lower().startswith("postgres://") or DATABASE_URL.lower().startswith("postgresql://")):
+        # redact helper for safe logs
+        def redact(url: str) -> str:
+            try:
+                pre, rest = url.split("://", 1)
+                if "@" in rest and ":" in rest.split("@", 1)[0]:
+                    user, after_user = rest.split("@", 1)[0], rest.split("@", 1)[1]
+                    user_name = user.split(":")[0]
+                    return f"{pre}://{user_name}:***@{after_user}"
+            except Exception:
+                pass
+            return url
+
+        if not DATABASE_URL:
+            if DEBUG_BOOT: print("[DB] DATABASE_URL is empty -> using SQLite")
             return False
+        if not (DATABASE_URL.lower().startswith("postgres://")
+                or DATABASE_URL.lower().startswith("postgresql://")):
+            if DEBUG_BOOT: print("[DB] DATABASE_URL present but not postgres:// -> using SQLite")
+            return False
+
         try:
             import psycopg2
             import psycopg2.pool
             import psycopg2.extras
-        except Exception:
+        except Exception as e:
+            if DEBUG_BOOT: print(f"[DB] psycopg2 import failed -> {e!r} ; falling back to SQLite")
             return False
+
         try:
+            if DEBUG_BOOT: print(f"[DB] Attempting Postgres pool connect -> {redact(DATABASE_URL)}")
             cls.pg_extras = psycopg2.extras
             cls.pool = psycopg2.pool.SimpleConnectionPool(
                 PG_MINCONN, PG_MAXCONN, dsn=DATABASE_URL,
@@ -106,7 +127,6 @@ class DB:
                           ts BIGINT NOT NULL
                         );
                     """)
-                    # Useful indexes
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_ts       ON memories(ts DESC);")
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_user     ON memories(user_id);")
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_thread   ON memories(thread_id);")
@@ -114,8 +134,10 @@ class DB:
                 conn.commit()
             cls.kind = "postgres"
             cls.placeholder = "%s"
+            if DEBUG_BOOT: print("[DB] Postgres connection OK; storage=postgres")
             return True
-        except Exception:
+        except Exception as e:
+            if DEBUG_BOOT: print(f"[DB] Postgres connect/init failed -> {type(e).__name__}: {e} ; falling back to SQLite")
             return False
 
     @classmethod
@@ -127,7 +149,6 @@ class DB:
         finally:
             cls.pool.putconn(conn)
 
-    # --- SQLite ---
     @staticmethod
     def _dir_writable(p: Path) -> bool:
         try:
@@ -173,7 +194,6 @@ class DB:
         cls.kind = "sqlite"
         cls.placeholder = "?"
 
-    # --- Public helpers ---
     @classmethod
     def init(cls):
         if cls.try_postgres():
@@ -205,7 +225,6 @@ class DB:
 
     @classmethod
     def select_latest_in_thread(cls, user_id: str, thread_id: str):
-        # returns most recent shard in a (user, thread) or None
         if cls.kind == "postgres":
             with cls.get_pg_conn() as conn:
                 with conn.cursor(cursor_factory=cls.pg_extras.RealDictCursor) as cur:
@@ -314,7 +333,6 @@ def add_headers(resp):
     if request.path == "/get_memory":
         resp.headers["Cache-Control"] = "no-store"
         resp.headers["Pragma"] = "no-cache"
-    # soft security headers
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["X-Frame-Options"] = "DENY"
@@ -358,6 +376,8 @@ def health():
     detail = {"ok": True, "ts": int(time.time()), "storage": DB.kind}
     if DB.kind == "sqlite":
         detail["sqlite_path"] = getattr(DB, "sqlite_path", "?")
+    if DEBUG_BOOT:
+        detail["has_db_url"] = bool(DATABASE_URL)
     return jsonify(detail)
 
 @app.route("/save_memory", methods=["POST","OPTIONS"])
@@ -366,7 +386,6 @@ def save_memory():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    # simple per-IP rate limit
     if not rate_limit_ok(f"save:{client_ip()}", max_per_min=120):
         return jsonify({"ok": False, "error": "Rate limit"}), 429
 
@@ -386,10 +405,7 @@ def save_memory():
     seal        = sanitize_seal(data.get("seal", "lawful"))
 
     slide_id = str(data.get("slide_id", "")).strip()
-    if not slide_id:
-        slide_id = next_slide_id_for(user_id, thread_id)
-    elif not SLIDE_RE.match(slide_id):
-        # If client supplied something non-conforming, normalize to next auto
+    if not slide_id or not SLIDE_RE.match(slide_id):
         slide_id = next_slide_id_for(user_id, thread_id)
 
     rec = {
@@ -429,7 +445,7 @@ def get_memory():
         return jsonify({"ok": False, "error": "limit must be an integer"}), 400
 
     before_ts = None
-    if "before_ts" in args and args.get("before_ts"):
+    if args.get("before_ts"):
         try:
             before_ts = int(args.get("before_ts"))
         except ValueError:
