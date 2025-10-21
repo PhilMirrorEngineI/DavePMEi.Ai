@@ -6,3 +6,5 @@ click==8.1.7
 markupsafe==2.1.5
 python-dotenv==1.0.1
 psycopg2-binary==2.9.9
+requests==2.32.3
+openai==1.51.2
