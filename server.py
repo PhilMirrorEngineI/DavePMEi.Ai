@@ -1,23 +1,28 @@
-# DavePMEi Memory API — Hybrid Neon(Postgres) + SQLite Fallback (lawful PMEi v1.1)
+# DavePMEi Reflection API — Dual Mode (Memory + Lawful Reflection) v1.2
+# ---------------------------------------------------------------
+# A lawful reflection server for PMEi (PhilMirrorEnginei.ai)
+# Supports both legacy memory endpoints and lawful reflection mode.
+# Hybrid Neon (Postgres) + SQLite fallback architecture.
+#
 # Endpoints:
 #   GET  /health
 #   GET  /
-#   POST /save_memory     (auth)
-#   GET  /get_memory      (auth)
+#   POST /save_memory       (auth, legacy)
+#   GET  /get_memory        (auth, legacy)
+#   POST /save_reflection   (auth, lawful)
+#   GET  /get_reflection    (auth, lawful)
 #
 # Env:
-#   MEMORY_API_KEY, ALLOWED_ORIGIN, DATABASE_URL, DB_PATH, MAX_CONTENT_CHARS
-#   PG_MINCONN/PG_MAXCONN, DEBUG_BOOT
-#   ENABLE_KEEPALIVE=true
-#   KEEPALIVE_INTERVAL=60
-#   SELF_HEALTH_URL=https://davepmei-ai.onrender.com/health
+#   MEMORY_API_KEY, ALLOWED_ORIGIN, DATABASE_URL, DB_PATH
+#   PG_MINCONN, PG_MAXCONN, DEBUG_BOOT
+#   ENABLE_KEEPALIVE, KEEPALIVE_INTERVAL, SELF_HEALTH_URL
+# ---------------------------------------------------------------
 
-import os, time, threading, re, uuid, sqlite3, contextlib
+import os, time, threading, re, sqlite3, contextlib, requests
 from pathlib import Path
 from collections import defaultdict
 from flask import Flask, request, jsonify
 from functools import wraps
-import requests
 
 app = Flask(__name__)
 
@@ -33,7 +38,7 @@ DEBUG_BOOT        = os.getenv("DEBUG_BOOT", "0") == "1"
 
 SAFE_SEALS = {"ok", "important", "critical", "lawful"}
 GLYPH_MAX = 16
-SLIDE_RE  = re.compile(r"^t-\d{3,6}$")
+SLIDE_RE  = re.compile(r"^[tr]-\d{3,6}$")  # t-### for memory, r-### for reflection
 RATE_BUCKET = defaultdict(list)
 
 # ---------- Helpers ----------
@@ -58,6 +63,9 @@ def rate_limit_ok(key: str, max_per_min=120):
     bucket.append(now)
     return True
 
+def sanitize_kappa(k: str) -> str:
+    return (k or "verified").strip()[:64]
+
 # ---------- DB Layer ----------
 class DB:
     kind = "sqlite"
@@ -78,7 +86,7 @@ class DB:
             with cls.get_pg_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
-                        CREATE TABLE IF NOT EXISTS memories(
+                        CREATE TABLE IF NOT EXISTS reflections(
                           id BIGSERIAL PRIMARY KEY,
                           user_id TEXT NOT NULL,
                           thread_id TEXT NOT NULL,
@@ -88,6 +96,7 @@ class DB:
                           seal TEXT NOT NULL,
                           role TEXT NOT NULL,
                           content TEXT NOT NULL,
+                          checksum_kappa TEXT,
                           ts BIGINT NOT NULL
                         );
                     """)
@@ -114,7 +123,7 @@ class DB:
         cls.sqlite = sqlite3.connect(str(cfg), check_same_thread=False)
         cls.sqlite.row_factory = sqlite3.Row
         cls.sqlite.execute("""
-            CREATE TABLE IF NOT EXISTS memories(
+            CREATE TABLE IF NOT EXISTS reflections(
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               user_id TEXT NOT NULL,
               thread_id TEXT NOT NULL,
@@ -124,6 +133,7 @@ class DB:
               seal TEXT NOT NULL,
               role TEXT NOT NULL,
               content TEXT NOT NULL,
+              checksum_kappa TEXT,
               ts INTEGER NOT NULL
             );
         """)
@@ -136,48 +146,34 @@ class DB:
             cls.init_sqlite()
 
     @classmethod
-    def insert_memory(cls, rec):
+    def insert_reflection(cls, rec):
         if cls.kind == "postgres":
             with cls.get_pg_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(f"""
-                        INSERT INTO memories(user_id,thread_id,slide_id,glyph_echo,drift_score,seal,role,content,ts)
-                        VALUES({cls.placeholder},{cls.placeholder},{cls.placeholder},{cls.placeholder},{cls.placeholder},
-                               {cls.placeholder},{cls.placeholder},{cls.placeholder},{cls.placeholder});
-                    """, (rec["user_id"], rec["thread_id"], rec["slide_id"], rec["glyph_echo"], rec["drift_score"],
-                          rec["seal"], rec["role"], rec["content"], rec["ts"]))
+                        INSERT INTO reflections(user_id,thread_id,slide_id,glyph_echo,drift_score,
+                                                seal,role,content,checksum_kappa,ts)
+                        VALUES({cls.placeholder},{cls.placeholder},{cls.placeholder},{cls.placeholder},
+                               {cls.placeholder},{cls.placeholder},{cls.placeholder},{cls.placeholder},
+                               {cls.placeholder},{cls.placeholder});
+                    """, (rec["user_id"], rec["thread_id"], rec["slide_id"], rec["glyph_echo"],
+                          rec["drift_score"], rec["seal"], rec["role"], rec["content"],
+                          rec.get("checksum_kappa"), rec["ts"]))
                 conn.commit()
             return rec["slide_id"]
         else:
             cls.sqlite.execute("""
-                INSERT INTO memories(user_id,thread_id,slide_id,glyph_echo,drift_score,seal,role,content,ts)
-                VALUES(?,?,?,?,?,?,?,?,?)
-            """, (rec["user_id"], rec["thread_id"], rec["slide_id"], rec["glyph_echo"], rec["drift_score"],
-                  rec["seal"], rec["role"], rec["content"], rec["ts"]))
+                INSERT INTO reflections(user_id,thread_id,slide_id,glyph_echo,drift_score,
+                                        seal,role,content,checksum_kappa,ts)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
+            """, (rec["user_id"], rec["thread_id"], rec["slide_id"], rec["glyph_echo"],
+                  rec["drift_score"], rec["seal"], rec["role"], rec["content"],
+                  rec.get("checksum_kappa"), rec["ts"]))
             cls.sqlite.commit()
             return rec["slide_id"]
 
     @classmethod
-    def select_latest_in_thread(cls, user_id: str, thread_id: str):
-        if cls.kind == "postgres":
-            with cls.get_pg_conn() as conn:
-                with conn.cursor(cursor_factory=cls.pg_extras.RealDictCursor) as cur:
-                    cur.execute(f"""
-                        SELECT slide_id, ts FROM memories
-                        WHERE user_id={cls.placeholder} AND thread_id={cls.placeholder}
-                        ORDER BY ts DESC LIMIT 1;
-                    """, (user_id, thread_id))
-                    row = cur.fetchone()
-            return dict(row) if row else None
-        else:
-            row = cls.sqlite.execute("""
-                SELECT slide_id, ts FROM memories
-                WHERE user_id=? AND thread_id=? ORDER BY ts DESC LIMIT 1
-            """, (user_id, thread_id)).fetchone()
-            return dict(row) if row else None
-
-    @classmethod
-    def select_memories(cls, filters, limit:int, before_ts:int|None=None):
+    def select_reflections(cls, filters, limit:int, before_ts:int|None=None):
         clauses, params = [], []
         for key in ("user_id","thread_id","slide_id","seal","role"):
             val = filters.get(key)
@@ -192,16 +188,18 @@ class DB:
             with cls.get_pg_conn() as conn:
                 with conn.cursor(cursor_factory=cls.pg_extras.RealDictCursor) as cur:
                     cur.execute(f"""
-                        SELECT user_id,thread_id,slide_id,glyph_echo,drift_score,seal,role,content,ts
-                        FROM memories {where_sql}
+                        SELECT user_id,thread_id,slide_id,glyph_echo,drift_score,seal,role,content,
+                               checksum_kappa,ts
+                        FROM reflections {where_sql}
                         ORDER BY ts DESC LIMIT {cls.placeholder};
                     """, params + [limit])
                     rows = cur.fetchall()
             return [dict(r) for r in rows]
         else:
             rows = cls.sqlite.execute(f"""
-                SELECT user_id,thread_id,slide_id,glyph_echo,drift_score,seal,role,content,ts
-                FROM memories {where_sql} ORDER BY ts DESC LIMIT ?
+                SELECT user_id,thread_id,slide_id,glyph_echo,drift_score,seal,role,content,
+                       checksum_kappa,ts
+                FROM reflections {where_sql} ORDER BY ts DESC LIMIT ?
             """, params + [limit]).fetchall()
             return [dict(r) for r in rows]
 
@@ -262,59 +260,75 @@ def add_headers(resp):
 # ---------- Routes ----------
 @app.route("/")
 def root():
-    return jsonify({"ok": True, "service": "DavePMEi Memory API", "storage": DB.kind})
+    return jsonify({"ok": True, "service": "DavePMEi Reflection API", "mode": "dual", "storage": DB.kind})
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "ts": int(time.time()), "storage": DB.kind})
+    return jsonify({"ok": True, "ts": int(time.time()), "storage": DB.kind, "mode": "dual"})
 
+# ---- LEGACY MEMORY ----
 @app.route("/save_memory", methods=["POST", "OPTIONS"])
 @require_key
 def save_memory():
     if request.method == "OPTIONS": return ("", 204)
+    return _save_reflection_internal(legacy=True)
+
+@app.route("/get_memory", methods=["GET", "OPTIONS"])
+@require_key
+def get_memory():
+    if request.method == "OPTIONS": return ("", 204)
+    return _get_reflection_internal(legacy=True)
+
+# ---- LAWFUL REFLECTION ----
+@app.route("/save_reflection", methods=["POST", "OPTIONS"])
+@require_key
+def save_reflection():
+    if request.method == "OPTIONS": return ("", 204)
+    return _save_reflection_internal(legacy=False)
+
+@app.route("/get_reflection", methods=["GET", "OPTIONS"])
+@require_key
+def get_reflection():
+    if request.method == "OPTIONS": return ("", 204)
+    return _get_reflection_internal(legacy=False)
+
+# ---------- Core Logic ----------
+def _save_reflection_internal(legacy=False):
     if not rate_limit_ok(f"save:{request.remote_addr}", max_per_min=120):
         return jsonify({"ok": False, "error": "Rate limit"}), 429
-
     d = request.get_json(silent=True) or {}
     user_id = str(d.get("user_id", "")).strip()
     thread_id = (str(d.get("thread_id", "general")).strip() or "general")[:64]
     content = str(d.get("content", "")).strip()
     if not user_id or not content:
         return jsonify({"ok": False, "error": "Missing user_id or content"}), 400
-
     drift = clamp_drift(d.get("drift_score", 0.10))
     glyph = sanitize_glyph(d.get("glyph_echo", "🪞"))
     seal = sanitize_seal(d.get("seal", "lawful"))
     role = (str(d.get("role", "assistant")).strip() or "assistant")[:32]
+    kappa = sanitize_kappa(d.get("checksum_kappa", "verified"))
     slide_id = str(d.get("slide_id", "")).strip()
     if not slide_id or not SLIDE_RE.match(slide_id):
-        last = DB.select_latest_in_thread(user_id, thread_id)
-        if last and SLIDE_RE.match(last.get("slide_id", "")):
-            n = int(last["slide_id"].split("-")[1])
-            slide_id = f"t-{n+1:03d}"
-        else:
-            slide_id = "t-001"
-
+        prefix = "r-" if not legacy else "t-"
+        slide_id = f"{prefix}{int(time.time()) % 1000000:06d}"
     rec = dict(user_id=user_id, thread_id=thread_id, slide_id=slide_id,
-               glyph_echo=glyph, drift_score=drift, seal=seal,
-               role=role, content=content, ts=int(time.time()))
-    out_id = DB.insert_memory(rec)
-    return jsonify({"ok": True, "status": "ok", "slide_id": out_id, "ts": rec["ts"]}), 201
+               glyph_echo=glyph, drift_score=drift, seal=seal, role=role,
+               content=content, checksum_kappa=kappa, ts=int(time.time()))
+    out_id = DB.insert_reflection(rec)
+    return jsonify({"ok": True, "mode": "lawful" if not legacy else "legacy",
+                    "slide_id": out_id, "ts": rec["ts"], "checksum_kappa": kappa}), 201
 
-@app.route("/get_memory", methods=["GET", "OPTIONS"])
-@require_key
-def get_memory():
-    if request.method == "OPTIONS": return ("", 204)
+def _get_reflection_internal(legacy=False):
     if not rate_limit_ok(f"get:{request.remote_addr}", max_per_min=240):
         return jsonify({"ok": False, "error": "Rate limit"}), 429
-
     args = request.args
     filters = {k: args.get(k) for k in ("user_id","thread_id","slide_id","seal","role")}
     limit = max(1, min(int(args.get("limit", "50")), 200))
     before_ts = int(args.get("before_ts")) if args.get("before_ts") else None
-    items = DB.select_memories(filters, limit, before_ts)
+    items = DB.select_reflections(filters, limit, before_ts)
     next_cursor = items[-1]["ts"] if items else None
-    return jsonify({"ok": True, "count": len(items), "next_before_ts": next_cursor, "items": items}), 200
+    return jsonify({"ok": True, "mode": "lawful" if not legacy else "legacy",
+                    "count": len(items), "next_before_ts": next_cursor, "items": items}), 200
 
 # ---------- Local run ----------
 if __name__ == "__main__":
