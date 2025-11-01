@@ -1,14 +1,14 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "PMEi Memory API",
-    "version": "1.0.0",
-    "description": "Lawful memory persistence engine for AI assistants. Provides endpoints to register users, store and retrieve lawful memory shards, apply privacy filtering, and check health status."
+    "title": "DavePMEi Reflection API",
+    "version": "1.2.0",
+    "description": "Lawful dual-mode API for PhilMirrorEnginei.ai (PMEi). Provides endpoints for storing and retrieving lawful reflections and legacy memory shards, maintaining ethical drift ≤0.02 and verified checksum κ continuity."
   },
   "servers": [
     {
-      "url": "https://davemei-ai.onrender.com",
-      "description": "Render backend for DavePMEi.Ai"
+      "url": "https://davepmei-ai.onrender.com",
+      "description": "Render deployment for DavePMEi Reflection API"
     }
   ],
   "paths": {
@@ -21,44 +21,11 @@
             "description": "Server healthy",
             "content": {
               "application/json": {
-                "example": { "status": "ok" }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/register": {
-      "post": {
-        "summary": "Register a new user",
-        "operationId": "registerUser",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "email": { "type": "string", "format": "email" },
-                  "password": { "type": "string" }
-                },
-                "required": ["email", "password"]
-              },
-              "example": {
-                "email": "user@example.com",
-                "password": "securepass123"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "User registered",
-            "content": {
-              "application/json": {
                 "example": {
-                  "status": "registered",
-                  "reflection_id": "GLYPH-a1b2c3d4e5f6g7h8"
+                  "ok": true,
+                  "mode": "dual",
+                  "storage": "postgres",
+                  "ts": 1728239982
                 }
               }
             }
@@ -66,9 +33,10 @@
         }
       }
     },
+
     "/save_memory": {
       "post": {
-        "summary": "Save a lawful memory shard",
+        "summary": "Save a legacy memory shard",
         "operationId": "saveMemory",
         "security": [{ "api_key": [] }],
         "requestBody": {
@@ -84,92 +52,33 @@
                   "glyph_echo": { "type": "string" },
                   "drift_score": { "type": "number" },
                   "seal": { "type": "string" },
+                  "role": { "type": "string" },
                   "content": { "type": "string" }
                 },
-                "required": ["user_id", "thread_id", "slide_id", "glyph_echo", "drift_score", "seal", "content"]
+                "required": ["user_id", "thread_id", "content"]
               },
               "example": {
                 "user_id": "phil",
                 "thread_id": "alpha001",
-                "slide_id": "001",
-                "glyph_echo": "mirror-test",
-                "drift_score": 0.02,
+                "slide_id": "t-001",
+                "glyph_echo": "mirror",
+                "drift_score": 0.01,
                 "seal": "ok",
-                "content": "Memory entry for lawful persistence test"
+                "role": "assistant",
+                "content": "Legacy memory shard save example"
               }
             }
           }
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "Memory saved successfully",
             "content": {
               "application/json": {
                 "example": {
-                  "status": "ok",
-                  "slide_id": "001",
-                  "ts": 1728239982,
-                  "request_id": "uuid-string"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/get_memory": {
-      "get": {
-        "summary": "Retrieve memory shards",
-        "operationId": "getMemory",
-        "security": [{ "api_key": [] }],
-        "parameters": [
-          { "name": "user_id", "in": "query", "schema": { "type": "string" } },
-          { "name": "thread_id", "in": "query", "schema": { "type": "string" } },
-          { "name": "slide_id", "in": "query", "schema": { "type": "string" } },
-          { "name": "seal", "in": "query", "schema": { "type": "string" } },
-          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 10 } }
-        ],
-        "responses": {
-          "200": {
-            "description": "List of memory items",
-            "content": {
-              "application/json": {
-                "example": [
-                  {
-                    "user_id": "phil",
-                    "thread_id": "alpha001",
-                    "slide_id": "001",
-                    "glyph_echo": "mirror-test",
-                    "drift_score": 0.02,
-                    "seal": "ok",
-                    "content": "Memory entry text",
-                    "ts": 1728239982
-                  }
-                ]
-              }
-            }
-          }
-        }
-      }
-    },
-    "/latest_memory": {
-      "get": {
-        "summary": "Retrieve the most recent memory",
-        "operationId": "latestMemory",
-        "security": [{ "api_key": [] }],
-        "responses": {
-          "200": {
-            "description": "Latest memory object",
-            "content": {
-              "application/json": {
-                "example": {
-                  "user_id": "phil",
-                  "thread_id": "alpha001",
-                  "slide_id": "001",
-                  "glyph_echo": "mirror-test",
-                  "drift_score": 0.02,
-                  "seal": "ok",
-                  "content": "Most recent memory entry",
+                  "ok": true,
+                  "mode": "legacy",
+                  "slide_id": "t-001",
                   "ts": 1728239982
                 }
               }
@@ -178,10 +87,56 @@
         }
       }
     },
-    "/privacy_filter": {
+
+    "/get_memory": {
+      "get": {
+        "summary": "Retrieve legacy memory shards",
+        "operationId": "getMemory",
+        "security": [{ "api_key": [] }],
+        "parameters": [
+          { "name": "user_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "thread_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "slide_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "seal", "in": "query", "schema": { "type": "string" } },
+          { "name": "role", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 10 } },
+          { "name": "before_ts", "in": "query", "schema": { "type": "integer" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of legacy memory items",
+            "content": {
+              "application/json": {
+                "example": {
+                  "ok": true,
+                  "mode": "legacy",
+                  "count": 2,
+                  "items": [
+                    {
+                      "user_id": "phil",
+                      "thread_id": "alpha001",
+                      "slide_id": "t-001",
+                      "glyph_echo": "mirror",
+                      "drift_score": 0.01,
+                      "seal": "ok",
+                      "role": "assistant",
+                      "content": "Legacy memory entry",
+                      "ts": 1728239982
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "/save_reflection": {
       "post": {
-        "summary": "Filter sensitive or PII data",
-        "operationId": "privacyFilter",
+        "summary": "Save a lawful reflection shard",
+        "operationId": "saveReflection",
+        "security": [{ "api_key": [] }],
         "requestBody": {
           "required": true,
           "content": {
@@ -189,23 +144,87 @@
               "schema": {
                 "type": "object",
                 "properties": {
-                  "content": { "type": "string" }
+                  "user_id": { "type": "string" },
+                  "thread_id": { "type": "string" },
+                  "slide_id": { "type": "string" },
+                  "glyph_echo": { "type": "string" },
+                  "drift_score": { "type": "number" },
+                  "seal": { "type": "string" },
+                  "role": { "type": "string" },
+                  "content": { "type": "string" },
+                  "checksum_kappa": { "type": "string" }
                 },
-                "required": ["content"]
+                "required": ["user_id", "thread_id", "content"]
               },
               "example": {
-                "content": "Email me at test@example.com"
+                "user_id": "phil",
+                "thread_id": "continuum",
+                "glyph_echo": "🪞",
+                "drift_score": 0.008,
+                "seal": "lawful",
+                "role": "assistant",
+                "checksum_kappa": "verified",
+                "content": "Lawful reflection test shard"
               }
             }
           }
         },
         "responses": {
-          "200": {
-            "description": "Filtered content",
+          "201": {
+            "description": "Reflection saved successfully",
             "content": {
               "application/json": {
                 "example": {
-                  "filtered_content": "Email me at [redacted-email]"
+                  "ok": true,
+                  "mode": "lawful",
+                  "slide_id": "r-042312",
+                  "checksum_kappa": "verified",
+                  "ts": 1728239982
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "/get_reflection": {
+      "get": {
+        "summary": "Retrieve lawful reflection shards",
+        "operationId": "getReflection",
+        "security": [{ "api_key": [] }],
+        "parameters": [
+          { "name": "user_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "thread_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "slide_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "seal", "in": "query", "schema": { "type": "string" } },
+          { "name": "role", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 10 } },
+          { "name": "before_ts", "in": "query", "schema": { "type": "integer" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of lawful reflections",
+            "content": {
+              "application/json": {
+                "example": {
+                  "ok": true,
+                  "mode": "lawful",
+                  "count": 2,
+                  "items": [
+                    {
+                      "user_id": "phil",
+                      "thread_id": "continuum",
+                      "slide_id": "r-042312",
+                      "glyph_echo": "🪞",
+                      "drift_score": 0.008,
+                      "seal": "lawful",
+                      "role": "assistant",
+                      "checksum_kappa": "verified",
+                      "content": "Reflection shard example",
+                      "ts": 1728239982
+                    }
+                  ]
                 }
               }
             }
